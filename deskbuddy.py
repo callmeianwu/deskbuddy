@@ -342,6 +342,13 @@ CLIMB_CHANCE = 0.55        # odds he takes a wall rather than walking past it
 WALK_STRIDE = 5 * SCALE
 CLIMB_STRIDE = 2.5 * SCALE
 
+# Headroom. Above STAND_HEIGHT he walks upright; at CRAWL_HEIGHT he is flat out
+# on hands and knees, and in between he blends between the two.
+STAND_HEIGHT = LEG_LEN + TORSO_LEN + NECK_LEN + RADII[HEAD]
+CRAWL_HEIGHT = 15 * SCALE
+CROUCH_RATE = 0.08         # how fast the crouch blend follows the ceiling
+CRAWL_SLOWDOWN = 0.55      # fraction of walk speed and stride lost at full crawl
+
 
 def step_cycle(phase, stride, lift):
     cycle = (phase / math.tau) % 1.0
@@ -369,6 +376,7 @@ class Buddy:
         self.wall = None           # wall he is currently climbing
         self.climb_y = 0.0
         self.stun = 0
+        self.crouch = 0.0          # 0 upright, 1 flat on hands and knees
         self.free_frames = 0
         self.blink = 0
         self.look = (0.0, 0.0)
@@ -390,6 +398,32 @@ class Buddy:
         if self.ledge:
             return self.ledge["y"]
         return self.floor_y
+
+    def headroom(self):
+        return self.ground_y() - self.bounds.top()
+
+    def crouch_target(self):
+        """0 where he can stand, 1 where the ceiling forces him onto all fours."""
+        span = STAND_HEIGHT - CRAWL_HEIGHT
+        return max(0.0, min(1.0, (STAND_HEIGHT - self.headroom()) / span))
+
+    def crawl_pose(self, ax, gy, f, ph):
+        """Hands and knees, low enough to clear a ceiling CRAWL_HEIGHT above."""
+        hip_y = gy - 5.5 * SCALE
+        chest_x = ax + f * TORSO_LEN * 0.8
+        chest_y = gy - 7.2 * SCALE
+        pose = {
+            HIPS: (ax, hip_y),
+            CHEST: (chest_x, chest_y),
+            HEAD: (chest_x + f * 3 * SCALE, chest_y - 2.8 * SCALE),
+        }
+        stride = WALK_STRIDE * (1.0 - CRAWL_SLOWDOWN)
+        for hand, foot, offset in ((HAND_R, FOOT_L, 0.0),
+                                   (HAND_L, FOOT_R, math.pi)):
+            step, lift = step_cycle(ph + offset, stride, 1.8 * SCALE)
+            pose[hand] = (chest_x + f * (2.5 * SCALE + step), gy)
+            pose[foot] = (ax + f * (step - 5 * SCALE), gy - lift - SCALE)
+        return pose
 
     def set_pose(self, ax, gy):
         """Drop the ragdoll points onto a standing pose. Used to seed physics."""
@@ -432,21 +466,36 @@ class Buddy:
             hip_y = gy - LEG_LEN * 0.92 + bob
             chest_x = ax + lean * 0.6 * SCALE
             chest_y = hip_y - TORSO_LEN
-            p[HIPS].place(ax, hip_y)
-            p[CHEST].place(chest_x, chest_y)
-            p[HEAD].place(ax + lean * 1.1 * SCALE, chest_y - NECK_LEN)
-            for foot, offset in ((FOOT_L, 0.0), (FOOT_R, math.pi)):
-                step, lift = step_cycle(ph + offset, WALK_STRIDE, 3.2 * SCALE)
-                p[foot].place(ax + step * f, gy - lift)
             arm = 3.4 * SCALE
             hang = ARM_LEN * 0.72
-            p[HAND_L].place(chest_x - swing * arm * f, chest_y + hang)
-            p[HAND_R].place(chest_x + swing * arm * f, chest_y + hang)
+            pose = {
+                HIPS: (ax, hip_y),
+                CHEST: (chest_x, chest_y),
+                HEAD: (ax + lean * 1.1 * SCALE, chest_y - NECK_LEN),
+                HAND_L: (chest_x - swing * arm * f, chest_y + hang),
+                HAND_R: (chest_x + swing * arm * f, chest_y + hang),
+            }
+            for foot, offset in ((FOOT_L, 0.0), (FOOT_R, math.pi)):
+                step, lift = step_cycle(ph + offset, WALK_STRIDE, 3.2 * SCALE)
+                pose[foot] = (ax + step * f, gy - lift)
             if self.state == IDLE:
-                p[FOOT_L].place(ax - 2 * SCALE, gy)
-                p[FOOT_R].place(ax + 2 * SCALE, gy)
-                p[HAND_L].place(ax - 4 * SCALE, chest_y + hang)
-                p[HAND_R].place(ax + 4 * SCALE, chest_y + hang)
+                pose[FOOT_L] = (ax - 2 * SCALE, gy)
+                pose[FOOT_R] = (ax + 2 * SCALE, gy)
+                pose[HAND_L] = (ax - 4 * SCALE, chest_y + hang)
+                pose[HAND_R] = (ax + 4 * SCALE, chest_y + hang)
+            if self.crouch > 0.001:
+                crawl = self.crawl_pose(ax, gy, f, ph)
+                for i, (tx, ty) in crawl.items():
+                    sx, sy = pose[i]
+                    px = sx + (tx - sx) * self.crouch
+                    py = sy + (ty - sy) * self.crouch
+                    if i in (HAND_L, HAND_R):
+                        chest_x, chest_y = pose[CHEST]
+                        if math.hypot(px - chest_x, gy - chest_y) <= ARM_LEN:
+                            py = gy
+                    pose[i] = (px, py)
+            for i, (px_, py_) in pose.items():
+                p[i].place(px_, py_)
 
         elif self.state == SIT:
             breathe = math.sin(ph * 0.35) * 0.3 * SCALE
@@ -677,6 +726,8 @@ class Buddy:
     # -- per-frame --------------------------------------------------------
 
     def update(self, cursor):
+        goal = self.crouch_target() if self.state in (WALK, IDLE) else 0.0
+        self.crouch += max(-CROUCH_RATE, min(CROUCH_RATE, goal - self.crouch))
         if self.state == WALK:
             self.phase += WALK_SPEED * math.pi / (2 * WALK_STRIDE)
         elif self.state == CLIMB:
@@ -768,7 +819,8 @@ class Buddy:
             self.ledge = live
 
         if self.state == WALK:
-            self.anchor_x += WALK_SPEED * self.facing
+            self.anchor_x += (WALK_SPEED * (1.0 - CRAWL_SLOWDOWN * self.crouch)
+                              * self.facing)
             if self.allow_perch:
                 w = self.wall_ahead()
                 if w is not None and random.random() < CLIMB_CHANCE:
@@ -800,6 +852,10 @@ class Buddy:
 
     def pick_idle(self):
         roll = random.random()
+        if self.crouch > 0.35:
+            # no room to sit up or stretch out, so he just keeps crawling
+            self.timer = random.randint(160, 380)
+            return
         if roll < 0.15 and self.allow_perch and self.climb_candidates():
             target = random.choice(self.climb_candidates())
             self.ledge = target
@@ -1318,6 +1374,10 @@ class Overlay(QWidget):
         nx, ny = dy / d * self.buddy.facing, -dx / d * self.buddy.facing
         slack = math.sqrt(max(0.0, LEG_LEN ** 2 - d ** 2)) * 0.5
         ex, ey = (a.x + b_.x) / 2 + nx * slack, (a.y + b_.y) / 2 + ny * slack
+        if self.buddy.state in (WALK, IDLE):
+            crouch = self.buddy.crouch
+            ex += (b_.x + self.buddy.facing * 5 * SCALE - ex) * crouch
+            ey += (b_.y + SCALE - ey) * crouch
         p.setPen(QPen(col, int(2.4 * SCALE), Qt.SolidLine, Qt.SquareCap))
         p.drawLine(int(a.x), int(a.y), int(ex), int(ey))
         p.drawLine(int(ex), int(ey), int(b_.x), int(b_.y))
