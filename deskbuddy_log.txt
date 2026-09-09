@@ -1,0 +1,13 @@
+DeskBuddy build 9 - window reference fix  python 3.12.10  file C:\Users\IanWu\Downloads\DeskBud\deskbuddy.py
+step: QApplication created
+DeskBuddy on HP E233 (2)  screen 1920x1080 at (0,0)  walking line y=1032  spawn x=959  dpr=1.0  scale=3
+step: about to show()
+step: show() returned
+step: harden() returned
+step: tray created
+step: timers started, waiting for first tick
+step: Overlay() constructed and retained, entering event loop
+beacon on for 5s - look for a magenta panel in the middle of the screen
+1s in: 59 paints, buddy at 961,990, state 2
+WATCHDOG: healthy - 154 ticks, 153 paints, visible=True
+beacon over, enabling click-through now
