@@ -150,7 +150,7 @@ HEAD_ART = [
     ".SSSSSSS.",
     ".SSSSSSS.",
     "..SSSSS..",
-    "...OOO...",
+    "...SSS...",
 ]
 
 TORSO_ART = [
@@ -411,6 +411,7 @@ class Buddy:
         self.calm = 0              # frames where nothing can spook him
         self.panic_frames = 0
         self.panic_turn = 0        # cooldown so he does not jitter when cornered
+        self.cursor_near = 0.0     # 0 outside SPOOK_RADIUS, 1 right on top of him
         self.cursor_prev = None
         self.trail = []            # cursor samples, for throw velocity
         self.pose_state = self.state
@@ -813,13 +814,16 @@ class Buddy:
         if self.calm > 0:          # dusting himself off; deaf to the cursor
             self.calm -= 1
             self.spook = 0.0
+            self.cursor_near = 0.0
             return
 
         if not self.allow_panic:
             self.spook = 0.0
+            self.cursor_near = 0.0
             return
 
         near = max(0.0, 1.0 - d / SPOOK_RADIUS)
+        self.cursor_near = near
         if self.state in (WALK, IDLE, SIT, SLEEP, WARY, PANIC):
             self.spook += max(0.0, was - d) * near * SPOOK_GAIN
             if near > 0.55 and moved > 0.5:
@@ -944,8 +948,9 @@ class Buddy:
             self.facing = 1 if cx > self.anchor_x else -1
             want = self.anchor_x - self.facing * self.wary_speed()
             self.anchor_x = min(max(want, self.walk_min()), self.walk_max())
-            if abs(want - self.anchor_x) > 0.01:
-                self.spook += SPOOK_CORNERED    # nowhere left to go
+            if abs(want - self.anchor_x) > 0.01 and self.cursor_near > 0.0:
+                # nowhere left to go, but only while the cursor is still a threat
+                self.spook += SPOOK_CORNERED * self.cursor_near
             self.animate()
             return
 
