@@ -427,18 +427,21 @@ class Buddy:
             swing = math.cos(ph) if self.state == WALK else 0.0
             bob = math.cos(ph) ** 2 * 0.65 * SCALE if self.state == WALK else \
                 math.sin(ph * 0.35) * 0.5 * SCALE
+            # idle turns to the viewer, so the profile lean drops out
+            lean = 0.0 if self.state == IDLE else f
             hip_y = gy - LEG_LEN * 0.92 + bob
+            chest_x = ax + lean * 0.6 * SCALE
             chest_y = hip_y - TORSO_LEN
             p[HIPS].place(ax, hip_y)
-            p[CHEST].place(ax + f * 0.6 * SCALE, chest_y)
-            p[HEAD].place(ax + f * 1.1 * SCALE, chest_y - NECK_LEN)
+            p[CHEST].place(chest_x, chest_y)
+            p[HEAD].place(ax + lean * 1.1 * SCALE, chest_y - NECK_LEN)
             for foot, offset in ((FOOT_L, 0.0), (FOOT_R, math.pi)):
                 step, lift = step_cycle(ph + offset, WALK_STRIDE, 3.2 * SCALE)
                 p[foot].place(ax + step * f, gy - lift)
             arm = 3.4 * SCALE
             hang = ARM_LEN * 0.72
-            p[HAND_L].place(ax - swing * arm * f - f * SCALE, chest_y + hang)
-            p[HAND_R].place(ax + swing * arm * f - f * SCALE, chest_y + hang)
+            p[HAND_L].place(chest_x - swing * arm * f, chest_y + hang)
+            p[HAND_R].place(chest_x + swing * arm * f, chest_y + hang)
             if self.state == IDLE:
                 p[FOOT_L].place(ax - 2 * SCALE, gy)
                 p[FOOT_R].place(ax + 2 * SCALE, gy)
@@ -1237,13 +1240,21 @@ class Overlay(QWidget):
                 self.arm(p, shoulder, pts[hand], -side)
                 self.seated_leg(p, hips, pts[foot], side)
             self.part(p, self.torso_pm, chest, hips)
+        elif b.state == IDLE:
+            # front view: both legs and arms read as near the camera
+            for foot in (FOOT_L, FOOT_R):
+                self.limb(p, hips, pts[foot], PALETTE["P"], PALETTE["F"], True)
+            self.part(p, self.torso_pm, chest, hips)
+            for hand, side in ((HAND_L, -1), (HAND_R, 1)):
+                shoulder = Pt(chest.x + side * 2.5 * SCALE, chest.y)
+                self.arm(p, shoulder, pts[hand], -side)
         else:
             back, front = (HAND_L, FOOT_L), (HAND_R, FOOT_R)
             if b.facing < 0:
                 back, front = front, back
 
             self.limb(p, hips, pts[back[1]], PALETTE["P"], PALETTE["F"], True)
-            self.arm(p, chest, pts[back[0]], -b.facing)
+            self.arm(p, chest, pts[back[0]], b.facing)
             self.part(p, self.torso_pm, chest, hips)
             self.limb(p, hips, pts[front[1]], PALETTE["P"], PALETTE["F"], True)
             self.arm(p, chest, pts[front[0]], b.facing)
