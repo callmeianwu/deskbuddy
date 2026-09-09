@@ -68,6 +68,76 @@ class AnimationTests(unittest.TestCase):
                 self.assertEqual(buddy.pts[db.FOOT_L].y, buddy.floor_y)
                 self.assertLess(buddy.pts[db.FOOT_R].y, buddy.floor_y)
 
+    def test_crawl_knees_alternate_while_both_hands_stay_grounded(self):
+        buddy = self.buddy
+        buddy.crouch = 1.0
+        for facing in (-1, 1):
+            buddy.facing = facing
+            for phase, planted, swinging in (
+                (math.pi / 2, (db.FOOT_L, db.HAND_R), (db.FOOT_R, db.HAND_L)),
+                (3 * math.pi / 2, (db.FOOT_R, db.HAND_L), (db.FOOT_L, db.HAND_R)),
+            ):
+                with self.subTest(facing=facing, phase=phase):
+                    buddy.phase = phase
+                    buddy.animate()
+                    for foot_index, hand_index in (planted, swinging):
+                        foot = buddy.pts[foot_index]
+                        painter = Mock()
+                        db.Overlay.limb(self, painter, buddy.pts[db.HIPS], foot,
+                                        db.PALETTE["P"], db.PALETTE["F"], True)
+                        knee_x, knee_y = painter.drawLine.call_args_list[0].args[2:]
+                        hand = buddy.pts[hand_index]
+                        self.assertEqual(hand.y, buddy.floor_y)
+                        self.assertLessEqual(knee_y, buddy.floor_y)
+                        self.assertGreater((knee_x - foot.x) * facing, 4 * db.SCALE)
+                        self.assertLess(foot.y, knee_y)
+
+    def test_crouching_only_grounds_hands_when_arms_can_reach(self):
+        buddy = self.buddy
+        buddy.crouch = 0.5
+        for phase in (0.0, math.pi):
+            buddy.phase = phase
+            buddy.animate()
+            for hand_index in (db.HAND_L, db.HAND_R):
+                hand = buddy.pts[hand_index]
+                chest = buddy.pts[db.CHEST]
+                self.assertLessEqual(math.hypot(hand.x - chest.x, hand.y - chest.y),
+                                     db.ARM_LEN + 0.001)
+        buddy.crouch = 1.0
+        buddy.animate()
+        for hand_index in (db.HAND_L, db.HAND_R):
+            self.assertEqual(buddy.pts[hand_index].y, buddy.floor_y)
+
+    def test_crawling_plants_knee_and_opposite_hand_while_moving(self):
+        for facing in (-1, 1):
+            for phase, foot_index, hand_index in (
+                (0.4, db.FOOT_L, db.HAND_R),
+                (math.pi + 0.4, db.FOOT_R, db.HAND_L),
+            ):
+                with self.subTest(facing=facing, phase=phase):
+                    buddy = db.Buddy(db.QRect(0, 0, 640, 480), db.CRAWL_HEIGHT)
+                    buddy.facing = facing
+                    buddy.crouch = 1.0
+                    buddy.phase = phase
+                    buddy.timer = 1000
+                    buddy.allow_perch = False
+                    buddy.animate()
+                    planted_foot_x = buddy.pts[foot_index].x
+                    planted_hand_x = buddy.pts[hand_index].x
+                    self.buddy = buddy
+                    for _ in range(6):
+                        buddy.update(db.QPoint(320, 100))
+                        foot = buddy.pts[foot_index]
+                        self.assertAlmostEqual(foot.x, planted_foot_x)
+                        self.assertAlmostEqual(buddy.pts[hand_index].x, planted_hand_x)
+                        painter = Mock()
+                        db.Overlay.limb(self, painter, buddy.pts[db.HIPS], foot,
+                                        db.PALETTE["P"], db.PALETTE["F"], True)
+                        knee_x, knee_y = painter.drawLine.call_args_list[0].args[2:]
+                        self.assertAlmostEqual(knee_x, planted_foot_x + facing * 5 * db.SCALE,
+                                               delta=1.0)
+                        self.assertEqual(knee_y, buddy.floor_y)
+
     def test_climbing_plants_opposite_hand_and_foot_on_wall(self):
         for facing in (-1, 1):
             buddy = self.buddy
@@ -224,7 +294,10 @@ class AnimationTests(unittest.TestCase):
         renderer.buddy = self.buddy
         renderer.head_pm = db.build_pixmap(db.HEAD_ART)
         renderer.torso_pm = db.build_pixmap(db.TORSO_ART)
-        for state in (db.WALK, db.IDLE, db.SIT, db.SLEEP, db.CLIMB):
+        for state, crouch in ((db.WALK, 0), (db.IDLE, 0), (db.SIT, 0),
+                              (db.SLEEP, 0), (db.CLIMB, 0),
+                              (db.WALK, 0.5), (db.WALK, 1), (db.IDLE, 1)):
+            self.buddy.crouch = crouch
             self.settle(state)
             self.buddy.climb_y = 240
             for frame in range(12):
