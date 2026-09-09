@@ -15,9 +15,14 @@ work.
 
     CONTROLS
         Left click + drag ... grab and throw him
+        Chase him ........... creep the mouse cursor up on him and he only
+                              eyes it and backs away; lunge at him and he
+                              bolts, arms flailing, and can run face first
+                              into a window edge and ragdoll off it
         Double click ....... he jumps
         Right click ........ menu (sit, nap, toss, perching toggle, quit)
-        Tray icon .......... backup quit if he ever gets stuck
+        Tray icon .......... turn the cursor fright on or off, and a backup
+                             quit if he ever gets stuck
 
     TWEAKING
         Every knob worth turning is in the CONFIG block below. SCALE changes
@@ -103,6 +108,23 @@ GRAB_RADIUS = 16 * SCALE
 WINDOW_SCAN_MS = 400
 MIN_LEDGE_WIDTH = 34 * SCALE
 STUN_FRAMES = 34        # how long he lies there before getting up
+# Nerve. It is fed by the cursor closing in on him, not by the cursor merely
+# being close, so a slow careful approach never sets him off - a lunge does.
+SPOOK_ENABLED = True        # start with the whole panic behaviour switched on
+SPOOK_RADIUS = 42 * SCALE   # outside this the cursor is just scenery
+SPOOK_GAIN = 0.019          # nerve per pixel of ground the cursor takes off him
+SPOOK_DECAY = 0.013         # bled off every frame, so a creeping cursor nets zero
+SPOOK_LOOM = 0.028          # extra for a cursor fidgeting right on top of him
+SPOOK_CORNERED = 0.014      # and for having nowhere left to back away to
+WARY_LEVEL = 0.34           # he stops, faces you and backs away
+WARY_SPEED = 0.42 * SCALE
+WARY_STRIDE = 2.6 * SCALE
+PANIC_LEVEL = 1.0           # he bolts
+PANIC_EXIT = 0.24           # and keeps running until his nerve drops to here
+JUMPY_NERVE = 0.52          # what a scare leaves behind, so round two is quicker
+PANIC_SPEED = 2.2 * SCALE   # he runs a lot faster than he walks
+PANIC_STRIDE = 7 * SCALE
+PANIC_MAX_FRAMES = FPS * 10          # he cannot sprint forever
 SIT_SWING_SECONDS = 3.6
 SIT_REST_SECONDS = 4.0
 FLOOR_MARGIN = 2        # used only when no taskbar is found along the bottom
@@ -336,7 +358,7 @@ class Pt:
 # The fella
 # --------------------------------------------------------------------------
 
-WALK, IDLE, SIT, SLEEP, GRABBED, FREE, STUNNED, CLIMB = range(8)
+WALK, IDLE, SIT, SLEEP, GRABBED, FREE, STUNNED, CLIMB, PANIC, WARY = range(10)
 CLIMB_SPEED = 0.55 * SCALE
 CLIMB_CHANCE = 0.55        # odds he takes a wall rather than walking past it
 WALK_STRIDE = 5 * SCALE
@@ -384,6 +406,12 @@ class Buddy:
         self.spin = 0.0
         self.support = [None] * 7  # ledge a point landed on this frame
         self.allow_perch = True
+        self.allow_panic = SPOOK_ENABLED
+        self.spook = 0.0           # nerve, 0 calm to PANIC_LEVEL and he bolts
+        self.calm = 0              # frames where nothing can spook him
+        self.panic_frames = 0
+        self.panic_turn = 0        # cooldown so he does not jitter when cornered
+        self.cursor_prev = None
         self.trail = []            # cursor samples, for throw velocity
         self.pose_state = self.state
         self.pose_from = None
@@ -449,7 +477,7 @@ class Buddy:
         if self.state != self.pose_state:
             if self.state == SIT:
                 self.sit_time = 0.0
-            settled = (WALK, IDLE, SIT, SLEEP)
+            settled = (WALK, IDLE, SIT, SLEEP, PANIC, WARY)
             if self.state in settled and self.pose_state in settled:
                 self.pose_from = [(point.x - ax, point.y - gy) for point in p]
                 self.pose_frame = 0
@@ -457,13 +485,20 @@ class Buddy:
                 self.pose_from = None
             self.pose_state = self.state
 
-        if self.state in (WALK, IDLE):
-            swing = math.cos(ph) if self.state == WALK else 0.0
-            bob = math.cos(ph) ** 2 * 0.65 * SCALE if self.state == WALK else \
+        if self.state in (WALK, IDLE, PANIC, WARY):
+            run = self.state == PANIC
+            if run:
+                stride, lift, swing_amt, lean = PANIC_STRIDE, 4.6 * SCALE, 1.0, f * 2.6
+            elif self.state == WARY:
+                stride, lift, swing_amt, lean = WARY_STRIDE, 1.1 * SCALE, 0.5, -f * 1.5
+            elif self.state == WALK:
+                stride, lift, swing_amt, lean = WALK_STRIDE, 3.2 * SCALE, 1.0, f
+            else:
+                stride, lift, swing_amt, lean = WALK_STRIDE, 3.2 * SCALE, 0.0, 0.0
+            swing = math.cos(ph) * swing_amt
+            bob = math.cos(ph) ** 2 * 0.65 * SCALE * swing_amt if swing_amt else \
                 math.sin(ph * 0.35) * 0.5 * SCALE
-            # idle turns to the viewer, so the profile lean drops out
-            lean = 0.0 if self.state == IDLE else f
-            hip_y = gy - LEG_LEN * 0.92 + bob
+            hip_y = gy - LEG_LEN * (0.86 if run else 0.92) + bob
             chest_x = ax + lean * 0.6 * SCALE
             chest_y = hip_y - TORSO_LEN
             arm = 3.4 * SCALE
@@ -476,8 +511,22 @@ class Buddy:
                 HAND_R: (chest_x + swing * arm * f, chest_y + hang),
             }
             for foot, offset in ((FOOT_L, 0.0), (FOOT_R, math.pi)):
-                step, lift = step_cycle(ph + offset, WALK_STRIDE, 3.2 * SCALE)
-                pose[foot] = (ax + step * f, gy - lift)
+                step, foot_lift = step_cycle(ph + offset, stride, lift)
+                pose[foot] = (ax + step * f, gy - foot_lift)
+            if run:
+                # arms straight up, flailing - the universal sign of panic
+                flail = math.sin(ph * 1.7) * 1.8 * SCALE
+                pose[HAND_L] = (chest_x - f * 1.6 * SCALE + flail,
+                                chest_y - ARM_LEN * 0.78 + abs(flail) * 0.25)
+                pose[HAND_R] = (chest_x - f * 3.2 * SCALE - flail,
+                                chest_y - ARM_LEN * 0.9 - abs(flail) * 0.25)
+            elif self.state == WARY:
+                # hands up between him and the cursor, ready to leg it
+                guard = (0.6 + 0.3 * math.sin(ph * 0.8)) * SCALE
+                pose[HAND_L] = (chest_x + f * 2.4 * SCALE,
+                                chest_y + hang * 0.3 - guard)
+                pose[HAND_R] = (chest_x + f * 3.4 * SCALE,
+                                chest_y + hang * 0.1 - guard)
             if self.state == IDLE:
                 pose[FOOT_L] = (ax - 2 * SCALE, gy)
                 pose[FOOT_R] = (ax + 2 * SCALE, gy)
@@ -681,6 +730,8 @@ class Buddy:
         self.ledge = best
         self.anchor_x = min(max(cx, self.walk_min()), self.walk_max())
         self.state = WALK
+        self.spook = 0.0
+        self.calm = int(FPS * 1.2)
         self.phase = random.uniform(0, 6.28)
         self.facing = 1 if random.random() < 0.5 else -1
         self.set_pose(self.anchor_x, self.ground_y())
@@ -708,6 +759,23 @@ class Buddy:
             return w
         return None
 
+    def wall_hit(self):
+        """A window edge right in front of him at running speed - a face full."""
+        gy = self.ground_y()
+        for w in self.walls:
+            if self.ledge and w["hwnd"] == self.ledge["hwnd"]:
+                continue
+            distance = (w["x"] - self.anchor_x) * self.facing
+            if not -PANIC_SPEED <= distance <= 4 * SCALE + PANIC_SPEED:
+                continue
+            if w["side"] * self.facing >= 0:
+                continue
+            # the edge has to actually be in his way, not above his head
+            if w["y1"] < gy - 4 * SCALE or w["y0"] > gy - 6 * SCALE:
+                continue
+            return w
+        return None
+
     def climb_candidates(self):
         """Ledges he could hop up to from where he stands."""
         gy = self.ground_y()
@@ -725,11 +793,50 @@ class Buddy:
 
     # -- per-frame --------------------------------------------------------
 
+    def wary_speed(self):
+        return WARY_SPEED * (0.4 + min(1.0, self.spook))
+
+    def sense_cursor(self, cx, cy):
+        """Feed the nerve meter from how hard the cursor is closing on him.
+
+        Both distances are measured from where he is now, so his own running
+        never counts as the cursor gaining on him.
+        """
+        bx, by = self.pts[CHEST].x, self.pts[CHEST].y
+        if self.cursor_prev is None:
+            self.cursor_prev = (cx, cy)
+        d = math.hypot(cx - bx, cy - by)
+        was = math.hypot(self.cursor_prev[0] - bx, self.cursor_prev[1] - by)
+        moved = math.hypot(cx - self.cursor_prev[0], cy - self.cursor_prev[1])
+        self.cursor_prev = (cx, cy)
+
+        if self.calm > 0:          # dusting himself off; deaf to the cursor
+            self.calm -= 1
+            self.spook = 0.0
+            return
+
+        if not self.allow_panic:
+            self.spook = 0.0
+            return
+
+        near = max(0.0, 1.0 - d / SPOOK_RADIUS)
+        if self.state in (WALK, IDLE, SIT, SLEEP, WARY, PANIC):
+            self.spook += max(0.0, was - d) * near * SPOOK_GAIN
+            if near > 0.55 and moved > 0.5:
+                self.spook += SPOOK_LOOM * near
+        self.spook = max(0.0, min(1.5, self.spook - SPOOK_DECAY))
+
     def update(self, cursor):
-        goal = self.crouch_target() if self.state in (WALK, IDLE) else 0.0
+        goal = self.crouch_target() if self.state in (WALK, IDLE, PANIC, WARY) \
+            else 0.0
         self.crouch += max(-CROUCH_RATE, min(CROUCH_RATE, goal - self.crouch))
         if self.state == WALK:
             self.phase += WALK_SPEED * math.pi / (2 * WALK_STRIDE)
+        elif self.state == PANIC:
+            self.phase += PANIC_SPEED * math.pi / (2 * PANIC_STRIDE)
+        elif self.state == WARY:
+            # backing up, so the step cycle runs the other way round
+            self.phase -= self.wary_speed() * math.pi / (2 * WARY_STRIDE)
         elif self.state == CLIMB:
             self.phase += CLIMB_SPEED * math.pi / (2 * CLIMB_STRIDE)
         else:
@@ -748,6 +855,20 @@ class Buddy:
         near = min(1.0, 260.0 / d)
         self.look = (max(-1, min(1, dx / 90)) * near,
                      max(-1, min(1, dy / 90)) * near)
+
+        cx, cy = cursor.x(), cursor.y()
+        self.sense_cursor(cx, cy)
+        if self.state in (WALK, IDLE, SIT, SLEEP, WARY):
+            if self.spook >= PANIC_LEVEL:
+                self.state = PANIC
+                self.panic_frames = 0
+                self.panic_turn = 0
+                self.facing = 1 if cx < self.anchor_x else -1
+            elif self.state != WARY and self.spook >= WARY_LEVEL:
+                self.state = WARY
+            elif self.state == WARY and self.spook < WARY_LEVEL * 0.55:
+                self.state = WALK
+                self.timer = random.randint(90, 220)
 
         if self.state == GRABBED:
             pt = self.pts[self.grab_idx]
@@ -817,6 +938,52 @@ class Buddy:
                 self.go_free(0, 0)          # his window moved out from under him
                 return
             self.ledge = live
+
+        if self.state == WARY:
+            # faces the cursor and gives ground, but will not back off a ledge
+            self.facing = 1 if cx > self.anchor_x else -1
+            want = self.anchor_x - self.facing * self.wary_speed()
+            self.anchor_x = min(max(want, self.walk_min()), self.walk_max())
+            if abs(want - self.anchor_x) > 0.01:
+                self.spook += SPOOK_CORNERED    # nowhere left to go
+            self.animate()
+            return
+
+        if self.state == PANIC:
+            self.panic_frames += 1
+            if self.spook < PANIC_EXIT or self.panic_frames > PANIC_MAX_FRAMES:
+                self.state = WARY           # stops, panting, still watching you
+                self.spook = max(self.spook, JUMPY_NERVE)
+                self.animate()
+                return
+            self.panic_turn -= 1
+            if (cx - self.anchor_x) * self.facing > 0 and self.panic_turn <= 0:
+                self.facing *= -1           # cursor got in front of him
+                self.panic_turn = int(FPS * 0.4)
+            self.anchor_x += (PANIC_SPEED * (1.0 - CRAWL_SLOWDOWN * self.crouch)
+                              * self.facing)
+            w = self.wall_hit()
+            if w is not None:               # straight into the side of a window
+                self.anchor_x = w["x"] + w["side"] * 2 * SCALE
+                self.go_free(-self.facing * PANIC_SPEED * 1.3,
+                             -PANIC_SPEED * 1.1,
+                             spin=-self.facing * random.uniform(0.05, 0.1))
+                self.spook = JUMPY_NERVE
+                return
+            lo, hi = self.walk_min(), self.walk_max()
+            if self.anchor_x < lo or self.anchor_x > hi:
+                self.anchor_x = min(max(self.anchor_x, lo), hi)
+                if self.ledge:              # runs clean off the ledge
+                    self.ledge = None
+                    self.go_free(self.facing * PANIC_SPEED * 0.8,
+                                 -PANIC_SPEED * 0.5,
+                                 spin=self.facing * random.uniform(0.02, 0.06))
+                    self.spook = JUMPY_NERVE
+                    return
+                self.facing *= -1           # cornered against the screen edge
+                self.panic_turn = int(FPS * 0.4)
+            self.animate()
+            return
 
         if self.state == WALK:
             self.anchor_x += (WALK_SPEED * (1.0 - CRAWL_SLOWDOWN * self.crouch)
@@ -1048,6 +1215,11 @@ class Overlay(QWidget):
         self.tray = QSystemTrayIcon(QIcon(self.head_pm), self)
         self.tray.setToolTip("DeskBuddy")
         m = QMenu()
+        spook = QAction("Scared of the cursor", m, checkable=True)
+        spook.setChecked(self.buddy.allow_panic)
+        spook.toggled.connect(self.set_panic)
+        m.addAction(spook)
+        m.addSeparator()
         act = QAction("Quit DeskBuddy", m)
         act.triggered.connect(QApplication.quit)
         m.addAction(act)
@@ -1200,6 +1372,14 @@ class Overlay(QWidget):
             self.buddy.go_free(0, 0)
         self.rescan()
 
+    def set_panic(self, on):
+        b = self.buddy
+        b.allow_panic = on
+        b.spook = 0.0
+        if not on and b.state in (PANIC, WARY):
+            b.state = WALK
+            b.timer = random.randint(120, 260)
+
     def reset(self):
         b = self.buddy
         b.ledges = self.floor_ledges() + [l for l in b.ledges if l["hwnd"] != -1]
@@ -1281,7 +1461,7 @@ class Overlay(QWidget):
         chest, hips, head = pts[CHEST], pts[HIPS], pts[HEAD]
 
         # contact shadow, only when he is settled on something
-        if b.state in (WALK, IDLE, SIT, SLEEP):
+        if b.state in (WALK, IDLE, SIT, SLEEP, PANIC, WARY):
             gy = b.ground_y()
             w = 13 * SCALE
             p.setPen(Qt.NoPen)
@@ -1318,6 +1498,8 @@ class Overlay(QWidget):
 
         if b.state == SLEEP:
             self.zzz(p, head)
+        if b.state in (PANIC, WARY):
+            self.fright(p, head)
         if DEBUG_OUTLINE:
             r = b.bounds_rect(6 * SCALE)
             p.setBrush(QColor(255, 0, 170, 50))
@@ -1334,14 +1516,13 @@ class Overlay(QWidget):
                                int(lg["x1"]), int(lg["y"]))
             names = {WALK: "walk", IDLE: "idle", SIT: "sit", SLEEP: "sleep",
                      GRABBED: "grabbed", FREE: "ragdoll", STUNNED: "stunned",
-                     CLIMB: "climb"}
+                     CLIMB: "climb", PANIC: "panic", WARY: "wary"}
             p.setPen(QColor(255, 255, 255))
             p.fillRect(self.virt.left() + 10, self.virt.top() + 10, 430, 96,
                        QColor(0, 0, 0, 190))
             p.drawText(self.virt.left() + 22, self.virt.top() + 34,
-                       f"state {names.get(b.state)}   head "
-                       f"{head.x:.0f},{head.y:.0f}   feet "
-                       f"{max(b.pts[FOOT_L].y, b.pts[FOOT_R].y):.0f}")
+                       f"state {names.get(b.state)}   nerve {b.spook:.2f}   "
+                       f"head {head.x:.0f},{head.y:.0f}")
             p.drawText(self.virt.left() + 22, self.virt.top() + 58,
                        f"floor y={b.floor_y}   screen {self.virt.width()}x"
                        f"{self.virt.height()}   ledges {len(b.ledges)}   "
@@ -1374,7 +1555,7 @@ class Overlay(QWidget):
         nx, ny = dy / d * self.buddy.facing, -dx / d * self.buddy.facing
         slack = math.sqrt(max(0.0, LEG_LEN ** 2 - d ** 2)) * 0.5
         ex, ey = (a.x + b_.x) / 2 + nx * slack, (a.y + b_.y) / 2 + ny * slack
-        if self.buddy.state in (WALK, IDLE):
+        if self.buddy.state in (WALK, IDLE, PANIC, WARY):
             crouch = self.buddy.crouch
             ex += (b_.x + self.buddy.facing * 5 * SCALE - ex) * crouch
             ey += (b_.y + SCALE - ey) * crouch
@@ -1383,7 +1564,7 @@ class Overlay(QWidget):
         p.drawLine(int(ex), int(ey), int(b_.x), int(b_.y))
         if with_shoe:
             ang = math.degrees(math.atan2(b_.y - ey, b_.x - ex)) - 90
-            if self.buddy.state in (WALK, IDLE):
+            if self.buddy.state in (WALK, IDLE, PANIC, WARY):
                 ang = 0
             p.save()
             p.translate(b_.x, b_.y)
@@ -1455,6 +1636,27 @@ class Overlay(QWidget):
             p.drawLine(int(x), int(y), int(x + 2 * s), int(y))
             p.drawLine(int(x + 2 * s), int(y), int(x), int(y + 2 * s))
             p.drawLine(int(x), int(y + 2 * s), int(x + 2 * s), int(y + 2 * s))
+
+    def fright(self, p, head):
+        """Marks over his head: one that grows as he gets nervous, then a
+        shaking pair once he bolts."""
+        b = self.buddy
+        # his arms go up over his head when he runs, so clear those too
+        top = min(head.y, b.pts[HAND_L].y, b.pts[HAND_R].y) - 7 * SCALE
+        if b.state == PANIC:
+            jitter = math.sin(b.phase * 2.3) * SCALE
+            marks = [(-9 * SCALE - jitter, 0.0), (9 * SCALE + jitter, 0.0)]
+        else:
+            grow = min(1.0, (b.spook - WARY_LEVEL * 0.55) * 3.0)
+            if grow <= 0.05:
+                return
+            marks = [(b.facing * 7 * SCALE, (1.0 - grow) * 3 * SCALE)]
+        for dx, dy in marks:
+            x, y = head.x + dx, top + dy
+            p.fillRect(int(x - SCALE // 2), int(y), max(1, SCALE),
+                       int(3 * SCALE), PALETTE["O"])
+            p.fillRect(int(x - SCALE // 2), int(y + 4 * SCALE), max(1, SCALE),
+                       max(1, SCALE), PALETTE["O"])
 
 
 def main():
