@@ -1,61 +1,66 @@
 # DeskBuddy
 
-A pixel art fella who lives on your taskbar.
+> A tiny pixel-art roommate for your Windows taskbar.
 
-He walks along the taskbar, scales the side edges of your real windows to get
-up onto their title bars, sits and dangles his legs over the drop, and naps.
-Windows that do not reach down near his feet are out of reach, and if one
-closes or moves while he is on it he falls. Grab him with the left mouse and
-throw him: he goes full ragdoll, tumbles across the screen, bounces off walls
-and window edges, lies there stunned, then picks himself up and gets back to
-work.
+Buddy walks the taskbar, climbs real window edges, perches on title bars, and
+takes the occasional nap. Catch him and throw him to send him into full
+ragdoll mode: he bounces, tumbles, gets briefly stunned, then pulls himself
+together and carries on. Sneak the cursor toward him and he gets wary; rush
+him and he runs for it.
 
-| Idle | Walking | Sitting |
+## Buddy At Work
+
+| Idle | Walking | Perched |
 | :--: | :--: | :--: |
 | ![Idle](assets/buddy_idle.png) | ![Walking](assets/buddy_walk.png) | ![Sitting](assets/buddy_sit.png) |
 
-| Napping | Climbing |
+| Napping | Window climbing |
 | :--: | :--: |
 | ![Napping](assets/buddy_sleep.png) | ![Climbing](assets/buddy_climb.png) |
 
-## Setup (Windows)
+| Alien abduction |
+| :--: |
+| ![Alien ship lifting Buddy from a wallpaper selection](assets/Screenshot%202026-09-15%20104611.png) |
 
-```
+## Get Him Running
+
+```powershell
 pip install PySide6
 python deskbuddy.py
 ```
 
-## Controls
+Buddy appears on the primary monitor, standing on the taskbar.
 
-| Action | Effect |
+## Play
+
+| Do this | Buddy does this |
 | --- | --- |
-| Left click + drag | Grab and throw him |
-| Double click | He jumps |
-| Right click | Menu (sit, nap, toss, perching toggle, quit) |
-| Tray icon | Backup quit if he ever gets stuck |
+| Left-click and drag | Grab and throw him into ragdoll mode |
+| Double-click | Jump |
+| Move the cursor slowly toward him | Get wary and back away |
+| Rush the cursor at him | Panic, sprint, and possibly wipe out |
+| Drag a wallpaper selection over him | Get caught in an alien tractor beam until release |
+| Right-click | Sit, nap, toss, toggle window perching, or quit |
+| Tray icon | Toggle cursor fright or quit if he gets stuck |
 
-## Tweaking
+## Make It Yours
 
-Every knob worth turning is in the `CONFIG` block at the top of
-[deskbuddy.py](deskbuddy.py). `SCALE` changes his size; `PALETTE` changes his
-clothes.
+The `CONFIG` block in [deskbuddy.py](deskbuddy.py) has the useful knobs:
+`SCALE` changes Buddy's size, `PALETTE` changes his clothes, and
+`SPOOK_ENABLED` controls the cursor-fright behavior.
 
-## Can't see him?
+## Lost Buddy?
 
-He lives on your primary monitor, standing on top of the taskbar. On start he
-prints the screen size and the exact line he walks along to
-[deskbuddy_log.txt](deskbuddy_log.txt). If he is still nowhere, set
-`DEBUG_OUTLINE = True` in the config block to draw a box around him and a
-line along his walking surface, or run:
+On launch, [deskbuddy_log.txt](deskbuddy_log.txt) records Buddy's screen size
+and taskbar walking line. If he is still missing, enable `DEBUG_OUTLINE` in
+the config block or run:
 
-```
+```powershell
 python deskbuddy.py --debug
 ```
 
-## Notes
+## Small Print
 
-The overlay is a single click-through window covering the primary monitor.
-Its input region is clipped to his body each frame, so clicks anywhere else
-go straight to whatever is underneath. He tracks resolution and taskbar
-changes at runtime. Fullscreen exclusive games will draw over him - that is
-normal and expected.
+The overlay is click-through except for Buddy himself, so the rest of the
+desktop stays usable. He follows resolution and taskbar changes at runtime.
+Fullscreen exclusive games draw over him; that is expected.
