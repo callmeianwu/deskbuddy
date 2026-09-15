@@ -88,6 +88,7 @@ from PySide6.QtGui import (
     QPainter,
     QPen,
     QPixmap,
+    QPolygon,
 )
 from PySide6.QtWidgets import QApplication, QMenu, QSystemTrayIcon, QWidget
 
@@ -133,6 +134,12 @@ SIT_REST_SECONDS = 4.0
 FLOOR_MARGIN = 2        # used only when no taskbar is found along the bottom
 DEBUG_OUTLINE = "--debug" in sys.argv   # python deskbuddy.py --debug
 BEACON_SECONDS = 5      # loud startup marker; set to 0 once you have seen him
+SELECTION_DRAG_MIN = 18
+SHIP_EXIT_FRAMES = int(FPS * 0.25)
+SHIP_AWAY_FRAMES = FPS * 6
+SHIP_PICKUP_Y = 34 * SCALE
+SHIP_RETURN_SPEED = 3.2 * SCALE
+ABDUCTION_FOLLOW_MAX = 12 * SCALE
 
 PALETTE = {
     "O": QColor(28, 24, 38),      # outline
@@ -273,6 +280,14 @@ user32.SetWindowPos.argtypes = [
     wt.HWND, wt.HWND, ctypes.c_int, ctypes.c_int,
     ctypes.c_int, ctypes.c_int, ctypes.c_uint,
 ]
+user32.GetAsyncKeyState.argtypes = [ctypes.c_int]
+user32.GetAsyncKeyState.restype = ctypes.c_short
+user32.WindowFromPoint.argtypes = [wt.POINT]
+user32.WindowFromPoint.restype = wt.HWND
+user32.GetParent.argtypes = [wt.HWND]
+user32.GetParent.restype = wt.HWND
+user32.GetWindow.argtypes = [wt.HWND, ctypes.c_uint]
+user32.GetWindow.restype = wt.HWND
 
 GWL_EXSTYLE = -20
 WS_EX_TOOLWINDOW = 0x00000080
@@ -281,6 +296,8 @@ DWMWA_CLOAKED = 14
 HWND_TOPMOST = -1
 SWP_NOMOVE, SWP_NOSIZE, SWP_NOACTIVATE = 0x0002, 0x0001, 0x0010
 SWP_NOZORDER, SWP_FRAMECHANGED = 0x0004, 0x0020
+VK_LBUTTON = 0x01
+GW_HWNDNEXT = 2
 
 SKIP_CLASSES = {
     "Progman", "WorkerW", "Shell_TrayWnd", "Shell_SecondaryTrayWnd",
@@ -293,6 +310,20 @@ def _class_name(hwnd):
     buf = ctypes.create_unicode_buffer(128)
     user32.GetClassNameW(hwnd, buf, 128)
     return buf.value
+
+
+def is_desktop_surface(point, self_hwnd=0):
+    """Whether a point belongs to Explorer's desktop window hierarchy."""
+    hwnd = user32.WindowFromPoint(wt.POINT(point.x(), point.y()))
+    if hwnd == self_hwnd:
+        hwnd = user32.GetWindow(hwnd, GW_HWNDNEXT)
+    for _ in range(5):
+        if not hwnd:
+            return False
+        if _class_name(hwnd) in {"Progman", "WorkerW", "SysListView32"}:
+            return True
+        hwnd = user32.GetParent(hwnd)
+    return False
 
 
 def _is_cloaked(hwnd):
@@ -423,7 +454,7 @@ class Pt:
 # The fella
 # --------------------------------------------------------------------------
 
-WALK, IDLE, SIT, SLEEP, GRABBED, FREE, STUNNED, CLIMB, PANIC, WARY = range(10)
+WALK, IDLE, SIT, SLEEP, GRABBED, FREE, STUNNED, CLIMB, PANIC, WARY, ABDUCT, ABOARD = range(12)
 CLIMB_SPEED = 0.55 * SCALE
 CLIMB_CHANCE = 0.55        # odds he takes a wall rather than walking past it
 WALK_STRIDE = 5 * SCALE
@@ -494,6 +525,8 @@ class Buddy:
         self.pose_state = self.state
         self.pose_from = None
         self.pose_frame = 0
+        self.abduct_target = None
+        self.abduct_follow_speed = 0.0
         self.set_pose(self.anchor_x, floor_y)
 
     # -- pose ------------------------------------------------------------
@@ -698,6 +731,30 @@ class Buddy:
             p[FOOT_R].place(ax + f * 6.5 * SCALE, gy - SCALE)
             p[HAND_L].place(ax - f * 2 * SCALE, hip_y - SCALE)
             p[HAND_R].place(ax + f * 2 * SCALE, hip_y - SCALE)
+
+        elif self.state == ABDUCT:
+            tx, ty = self.abduct_target or (self.anchor_x, self.ground_y())
+            bob = math.sin(ph * 1.4) * 1.2 * SCALE
+            pose = {
+                HIPS: (tx, ty + 2 * SCALE + bob),
+                CHEST: (tx, ty - TORSO_LEN + bob),
+                HEAD: (tx, ty - TORSO_LEN - NECK_LEN + bob),
+                HAND_L: (tx - 4 * SCALE, ty - TORSO_LEN * 0.35 + bob),
+                HAND_R: (tx + 4 * SCALE, ty - TORSO_LEN * 0.2 + bob),
+                FOOT_L: (tx - 3 * SCALE, ty + LEG_LEN * 0.55 + bob),
+                FOOT_R: (tx + 3 * SCALE, ty + LEG_LEN * 0.65 + bob),
+            }
+            max_step = min(ABDUCTION_FOLLOW_MAX,
+                           1.5 * SCALE + self.abduct_follow_speed)
+            for index, (target_x, target_y) in pose.items():
+                dx = target_x - p[index].x
+                dy = target_y - p[index].y
+                distance = math.hypot(dx, dy)
+                step = min(distance, max_step,
+                           max(distance * 0.08, self.abduct_follow_speed))
+                if distance > 0.001:
+                    p[index].place(p[index].x + dx / distance * step,
+                                   p[index].y + dy / distance * step)
 
         if self.pose_from is not None:
             self.pose_frame += 1
@@ -1068,6 +1125,58 @@ class Buddy:
             pt.kick(vx + random.uniform(-0.6, 0.6),
                     vy + random.uniform(-0.6, 0.6))
 
+    def begin_abduction(self, target):
+        """Suspend the buddy at the current selection rectangle's center."""
+        if self.state not in (WALK, IDLE, SIT, SLEEP, WARY, PANIC):
+            return False
+        self.state = ABDUCT
+        self.abduct_target = (target.x(), target.y())
+        self.abduct_follow_speed = 0.0
+        self.pose_from = None
+        self.spook = 0.0
+        self.calm = FPS
+        return True
+
+    def move_abduction(self, target):
+        if self.state != ABDUCT:
+            return
+        next_target = (target.x(), target.y())
+        old_target = self.abduct_target or next_target
+        self.abduct_follow_speed = math.hypot(next_target[0] - old_target[0],
+                                               next_target[1] - old_target[1]) * 1.1
+        self.abduct_target = next_target
+
+    def end_abduction(self):
+        if self.state != ABDUCT:
+            return False
+        self.abduct_target = None
+        self.abduct_follow_speed = 0.0
+        self.go_free(0.0, 2.0 * SCALE)
+        return True
+
+    def board_ship(self):
+        if self.state != ABDUCT:
+            return False
+        self.state = ABOARD
+        self.abduct_target = None
+        self.abduct_follow_speed = 0.0
+        return True
+
+    def begin_unloading(self, target):
+        self.state = ABDUCT
+        self.abduct_target = (target.x(), target.y())
+        self.abduct_follow_speed = 0.0
+        self.pose_from = None
+
+    def return_home(self, x):
+        self.ledge = next((ledge for ledge in self.ledges if ledge["hwnd"] == -1),
+                          None)
+        self.wall = None
+        self.anchor_x = min(max(x, self.walk_min()), self.walk_max())
+        self.state = WALK
+        self.timer = 200
+        self.set_pose(self.anchor_x, self.ground_y())
+
     def step_off(self, vx):
         """Walk clean off the ledge he is on, carrying his speed with him.
 
@@ -1201,6 +1310,8 @@ class Buddy:
         self.spook = max(0.0, min(1.5, self.spook - SPOOK_DECAY))
 
     def update(self, cursor):
+        if self.state == ABOARD:
+            return
         goal = self.crouch_target() if self.state in (WALK, IDLE, PANIC, WARY) \
             else 0.0
         self.crouch += max(-CROUCH_RATE, min(CROUCH_RATE, goal - self.crouch))
@@ -1463,6 +1574,102 @@ def build_pixmap(art):
     return pm
 
 
+class DesktopSelection:
+    """A desktop-only drag tracker kept independent of Qt mouse delivery."""
+    def __init__(self):
+        self.origin = None
+        self.was_down = False
+        self.triggered = False
+
+    def update(self, down, cursor, desktop):
+        if down and not self.was_down:
+            self.origin = QPoint(cursor) if desktop else None
+            self.triggered = False
+        self.was_down = down
+        if not down:
+            self.origin = None
+            return None
+        if self.origin is None:
+            return None
+        rect = QRect(self.origin, cursor).normalized()
+        if rect.width() < SELECTION_DRAG_MIN or rect.height() < SELECTION_DRAG_MIN:
+            return None
+        return rect
+
+
+class AlienShip:
+    def __init__(self):
+        self.rect = None
+        self.x = self.y = 0.0
+        self.frame = 0
+        self.mode = "idle"
+        self.bounds = None
+        self.pickup_y = 0.0
+        self.passenger_x = 0.0
+        self.returning = False
+
+    def begin(self, rect, bounds):
+        self.rect = QRect(rect)
+        self.x = rect.center().x()
+        self.bounds = QRect(bounds)
+        self.pickup_y = bounds.top() + SHIP_PICKUP_Y
+        self.y = self.pickup_y
+        self.frame = 0
+        self.mode = "hover"
+        self.returning = True
+
+    def set_beam_bottom(self, y):
+        if self.mode not in ("hover", "unloading"):
+            return
+        self.rect = QRect(int(self.x - 5 * SCALE), int(y), 10 * SCALE, 1)
+
+    def follow_selection(self, rect):
+        if self.mode != "hover":
+            return
+        self.rect = QRect(rect)
+        self.x += (rect.center().x() - self.x) * 0.18
+
+    def can_board(self, buddy):
+        head = buddy.pts[HEAD]
+        return self.mode == "hover" and \
+            abs(head.x - self.x) <= 12 * SCALE and \
+            head.y <= self.y + 5 * SCALE
+
+    def depart(self, passenger_x, returning=True):
+        self.rect = None
+        self.passenger_x = passenger_x
+        self.frame = 0
+        self.mode = "departing"
+        self.returning = returning
+
+    def update(self):
+        if self.mode == "idle" or self.bounds is None:
+            return False
+        self.frame += 1
+        if self.mode == "departing":
+            self.y -= SHIP_RETURN_SPEED
+            if self.y < self.bounds.top() - 20 * SCALE:
+                self.mode = "away" if self.returning else "idle"
+                self.frame = 0
+        elif self.mode == "away" and self.frame >= SHIP_AWAY_FRAMES:
+            self.x = self.passenger_x
+            self.y = self.bounds.top() - 20 * SCALE
+            self.mode = "returning"
+        elif self.mode == "returning":
+            self.y = min(self.pickup_y, self.y + SHIP_RETURN_SPEED)
+            if self.y >= self.pickup_y:
+                self.mode = "unloading"
+                return "returned"
+        return False
+
+    def bounds_rect(self):
+        if self.mode in ("idle", "away"):
+            return None
+        hull = QRect(int(self.x - 18 * SCALE), int(self.y - 8 * SCALE),
+                     int(36 * SCALE), int(16 * SCALE))
+        return hull if self.rect is None else hull.united(self.rect)
+
+
 class Overlay(QWidget):
     def __init__(self):
         super().__init__(None)
@@ -1499,6 +1706,12 @@ class Overlay(QWidget):
         self.buddy.set_pose(self.buddy.anchor_x, self.floor_y)
         self.clickthrough = None
         self.dragging = False
+        self.selection = DesktopSelection()
+        self.ship = AlienShip()
+        self.abduction_start_top = 0
+        self.abduction_start_target_y = 0
+        self.unloading_buddy = False
+        self.unload_target_y = 0.0
         self.frames = 0
         self.paints = 0
         self.dirty_prev = None   # his painted area last frame, so it gets erased
@@ -1636,13 +1849,55 @@ class Overlay(QWidget):
 
     def _tick(self):
         cursor = QCursor.pos()
+        left_down = bool(user32.GetAsyncKeyState(VK_LBUTTON) & 0x8000)
+        selection = self.selection.update(left_down, cursor,
+                                          is_desktop_surface(cursor, self.hwnd()))
+        b = self.buddy
+        if selection is not None and not self.selection.triggered:
+            if selection.intersects(b.bounds_rect(2 * SCALE)) and \
+                    b.begin_abduction(selection.center()):
+                self.selection.triggered = True
+                self.ship.begin(selection, self.virt)
+                self.abduction_start_top = selection.top()
+                self.abduction_start_target_y = selection.center().y()
+        if b.state == ABDUCT:
+            if self.unloading_buddy:
+                landing_y = self.floor_y - LEG_LEN * 0.65
+                self.unload_target_y = min(landing_y,
+                                           self.unload_target_y + SHIP_RETURN_SPEED)
+                target = QPoint(int(self.ship.x), int(self.unload_target_y))
+            elif selection is None:
+                if b.end_abduction():
+                    self.ship.depart(b.pts[HEAD].x, returning=False)
+            else:
+                self.ship.follow_selection(selection)
+                target = QPoint(int(self.ship.x),
+                                int(self.ship.pickup_y + TORSO_LEN + NECK_LEN))
+            if b.state == ABDUCT:
+                b.move_abduction(target)
         if self.dragging:
             self.buddy.trail.append((cursor.x(), cursor.y()))
             if len(self.buddy.trail) > 6:
                 self.buddy.trail.pop(0)
         self.buddy.update(cursor)
+        if b.state == ABDUCT and self.unloading_buddy:
+            self.ship.set_beam_bottom(max(point.y for point in b.pts) + SCALE)
+        if b.state == ABDUCT and not self.unloading_buddy and self.ship.can_board(b):
+            if b.board_ship():
+                self.ship.depart(b.pts[HEAD].x)
+        ship_returned = self.ship.update()
+        if b.state == ABOARD and ship_returned == "returned":
+            self.unloading_buddy = True
+            self.unload_target_y = self.ship.pickup_y + TORSO_LEN + NECK_LEN
+            b.begin_unloading(QPoint(int(self.ship.x), int(self.unload_target_y)))
+        elif self.unloading_buddy and \
+                self.unload_target_y >= self.floor_y - LEG_LEN * 0.65 and \
+                abs(b.pts[HIPS].y - (self.unload_target_y + 2 * SCALE)) <= SCALE:
+            b.return_home(self.ship.x)
+            self.unloading_buddy = False
+            self.ship.depart(self.ship.x, returning=False)
 
-        new = self.buddy.bounds_rect(10 * SCALE)
+        new = self.effect_bounds()
         self.frames += 1
         beacon = self.frames < FPS * BEACON_SECONDS
 
@@ -1698,11 +1953,16 @@ class Overlay(QWidget):
             # invalidate where he was and where he now is; Qt clears that
             # region to transparent before paintEvent runs, so nothing is
             # left behind.
-            dirty = self.buddy.bounds_rect(30 * SCALE) \
+            dirty = self.effect_bounds() \
                 .translated(-self.virt.left(), -self.virt.top())
             region = dirty if self.dirty_prev is None else dirty.united(self.dirty_prev)
             self.dirty_prev = dirty
             self.update(region)
+
+    def effect_bounds(self):
+        bounds = self.buddy.bounds_rect(30 * SCALE)
+        ship_bounds = self.ship.bounds_rect()
+        return bounds if ship_bounds is None else bounds.united(ship_bounds)
 
     # -- input ------------------------------------------------------------
 
@@ -1825,6 +2085,7 @@ class Overlay(QWidget):
         # code is not. Without this the exception goes to stderr and you see
         # nothing at all.
         try:
+            self.draw_abduction(p)
             self.draw_buddy(p)
         except Exception:
             if self.paint_error is None:
@@ -1832,6 +2093,30 @@ class Overlay(QWidget):
                 self.paint_error = traceback.format_exc()
                 log("drawing the buddy raised:\n" + self.paint_error)
         p.end()
+
+    def draw_abduction(self, p):
+        ship = self.ship
+        if ship.mode in ("idle", "away"):
+            return
+        cx, cy = int(ship.x), int(ship.y)
+        if ship.rect is not None:
+            p.setPen(Qt.NoPen)
+            p.setBrush(QColor(105, 255, 177, 48))
+            p.drawPolygon(QPolygon([
+                QPoint(cx - 8 * SCALE, cy + 4 * SCALE),
+                QPoint(cx + 8 * SCALE, cy + 4 * SCALE),
+                ship.rect.topRight(),
+                ship.rect.bottomRight(),
+                ship.rect.bottomLeft(),
+                ship.rect.topLeft(),
+            ]))
+        p.setBrush(QColor(82, 92, 112))
+        p.drawEllipse(QPoint(cx, cy), 10 * SCALE, 4 * SCALE)
+        p.setBrush(QColor(142, 238, 204))
+        p.drawEllipse(QPoint(cx, cy - 3 * SCALE), 4 * SCALE, 3 * SCALE)
+        p.setBrush(QColor(255, 220, 90))
+        p.drawEllipse(QPoint(cx - 6 * SCALE, cy + SCALE), SCALE, SCALE)
+        p.drawEllipse(QPoint(cx + 6 * SCALE, cy + SCALE), SCALE, SCALE)
 
     def draw_beacon(self, p):
         """Loud, unmissable startup marker drawn in known-good screen space."""
@@ -1874,6 +2159,8 @@ class Overlay(QWidget):
 
     def draw_buddy(self, p):
         b = self.buddy
+        if b.state == ABOARD:
+            return
         pts = b.pts
         chest, hips, head = pts[CHEST], pts[HIPS], pts[HEAD]
 
