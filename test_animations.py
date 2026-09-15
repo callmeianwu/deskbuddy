@@ -271,6 +271,71 @@ class AnimationTests(unittest.TestCase):
             self.assertAlmostEqual(point.vx, 4, delta=0.61)
             self.assertAlmostEqual(point.vy, -8, delta=0.61)
 
+    def test_desktop_selection_requires_a_real_normalized_drag(self):
+        selection = db.DesktopSelection()
+        self.assertIsNone(selection.update(True, db.QPoint(100, 100), True))
+        self.assertIsNone(selection.update(True, db.QPoint(110, 110), True))
+        rect = selection.update(True, db.QPoint(40, 50), True)
+        self.assertLess(rect.left(), 50)
+        self.assertLess(rect.top(), 60)
+        self.assertGreaterEqual(rect.width(), db.SELECTION_DRAG_MIN)
+        self.assertGreaterEqual(rect.height(), db.SELECTION_DRAG_MIN)
+        self.assertIsNone(selection.update(False, db.QPoint(40, 50), True))
+        self.assertIsNone(selection.update(True, db.QPoint(10, 10), False))
+
+    def test_abduction_only_accepts_settled_buddy_and_drops_on_release(self):
+        buddy = self.buddy
+        target = db.QPoint(320, 160)
+        start_x = buddy.pts[db.HIPS].x
+        self.assertTrue(buddy.begin_abduction(target))
+        self.assertEqual(buddy.state, db.ABDUCT)
+        buddy.update(db.QPoint(0, 0))
+        self.assertGreater(buddy.pts[db.HIPS].x, start_x)
+        self.assertLess(buddy.pts[db.HIPS].x, target.x())
+        slow_step = buddy.pts[db.HIPS].x - start_x
+        before_fast_follow = buddy.pts[db.HIPS].x
+        buddy.move_abduction(db.QPoint(520, 160))
+        buddy.update(db.QPoint(0, 0))
+        self.assertGreater(buddy.pts[db.HIPS].x - before_fast_follow, slow_step)
+        buddy.move_abduction(target)
+        for _ in range(180):
+            buddy.update(db.QPoint(0, 0))
+        self.assertAlmostEqual(buddy.pts[db.HIPS].x, target.x(), delta=db.SCALE)
+        self.assertTrue(buddy.end_abduction())
+        self.assertEqual(buddy.state, db.FREE)
+        self.assertFalse(buddy.end_abduction())
+        buddy.state = db.GRABBED
+        self.assertFalse(buddy.begin_abduction(target))
+
+    def test_ship_collects_buddy_then_returns_after_away_delay(self):
+        ship = db.AlienShip()
+        bounds = db.QRect(0, 0, 640, 480)
+        rect = db.QRect(280, 180, 80, 80)
+        ship.begin(rect, bounds)
+        moved_rect = db.QRect(360, 140, 160, 120)
+        ship.follow_selection(moved_rect)
+        self.assertEqual(ship.rect, moved_rect)
+        self.assertGreater(ship.x, rect.center().x())
+        self.assertTrue(self.buddy.begin_abduction(rect.center()))
+        lift_target = db.QPoint(int(ship.x),
+                                int(ship.pickup_y + db.TORSO_LEN + db.NECK_LEN))
+        for _ in range(60):
+            self.buddy.move_abduction(lift_target)
+            self.buddy.update(db.QPoint(0, 0))
+            if ship.can_board(self.buddy):
+                break
+        self.assertTrue(ship.can_board(self.buddy))
+        self.assertTrue(self.buddy.board_ship())
+        ship.depart(self.buddy.pts[db.HEAD].x)
+        returned = False
+        for _ in range(db.SHIP_AWAY_FRAMES + 200):
+            returned = ship.update() or returned
+            if returned:
+                break
+        self.assertEqual(returned, "returned")
+        self.assertEqual(ship.mode, "unloading")
+        self.assertEqual(self.buddy.state, db.ABOARD)
+
     def test_seated_pose_follows_ledge(self):
         self.buddy.ledge = {"x0": 80, "x1": 560, "y": 180, "hwnd": 123}
         self.settle(db.SIT)
@@ -397,6 +462,7 @@ class AnimationTests(unittest.TestCase):
         for state, crouch in ((db.WALK, 0), (db.IDLE, 0), (db.SIT, 0),
                               (db.SLEEP, 0), (db.CLIMB, 0),
                               (db.FREE, 0), (db.GRABBED, 0), (db.STUNNED, 0),
+                              (db.ABDUCT, 0),
                               (db.WALK, 0.5), (db.WALK, 1), (db.IDLE, 1)):
             self.buddy.crouch = crouch
             self.settle(state)
