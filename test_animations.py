@@ -280,6 +280,106 @@ class AnimationTests(unittest.TestCase):
         for point, old_y in zip(self.buddy.pts, before):
             self.assertAlmostEqual(point.y - old_y, 30)
 
+    def bone_lengths(self, buddy):
+        for a, b, rest, stiff in db.STICKS:
+            if stiff < 0.9:
+                continue
+            span = math.hypot(buddy.body[b].x - buddy.body[a].x,
+                              buddy.body[b].y - buddy.body[a].y)
+            self.assertAlmostEqual(span, rest, delta=rest * 0.3)
+
+    def hip_swing(self, buddy):
+        """How far past its limit the worst thigh has swung, in degrees."""
+        up, forward = buddy.body_frame()
+        down = (-up[0], -up[1])
+        worst = 0.0
+        for root, joint, _tip, _span, _bulge, ahead, behind, _fold in db.RAG_LIMBS:
+            dx = buddy.body[joint].x - buddy.body[root].x
+            dy = buddy.body[joint].y - buddy.body[root].y
+            angle = math.atan2(dx * forward[0] + dy * forward[1],
+                               dx * down[0] + dy * down[1])
+            worst = max(worst, math.degrees(max(0.0, angle - ahead,
+                                                -behind - angle)))
+        return worst
+
+    def test_thrown_ragdoll_holds_together_and_gets_back_up(self):
+        for vx, vy, spin in ((13, -9, 0.07), (-18, -4, -0.09), (2, -16, 0.0)):
+            with self.subTest(throw=(vx, vy)):
+                buddy = self.buddy = db.Buddy(db.QRect(0, 0, 640, 480), 240)
+                buddy.ledges = [{"x0": 4, "x1": 636, "y": 240, "hwnd": -1}]
+                buddy.ledge = buddy.ledges[0]
+                buddy.allow_panic = False
+                buddy.go_free(vx, vy, spin)
+                for _ in range(400):
+                    buddy.update(db.QPoint(620, 20))
+                    self.bone_lengths(buddy)
+                    for point in buddy.body:
+                        self.assertTrue(math.isfinite(point.x))
+                        self.assertTrue(math.isfinite(point.y))
+                    if buddy.state == db.WALK:
+                        break
+                else:
+                    self.fail(f"never got up, stuck in state {buddy.state}")
+                self.assertLessEqual(self.hip_swing(buddy), 8)
+
+    def test_ragdoll_limbs_bend_instead_of_staying_rigid(self):
+        buddy = self.buddy
+        buddy.ledges = [{"x0": 4, "x1": 636, "y": 240, "hwnd": -1}]
+        buddy.ledge = buddy.ledges[0]
+        buddy.state = db.GRABBED
+        buddy.grab_idx = db.HEAD
+        buddy.seed_joints()
+        hand = db.QPoint(int(buddy.pts[db.HEAD].x), int(buddy.pts[db.HEAD].y))
+        for frame in range(240):
+            buddy.update(db.QPoint(hand.x() + int(40 * math.sin(frame * 0.05)),
+                                   hand.y() - min(frame, 90)))
+            self.bone_lengths(buddy)
+        hips = buddy.pts[db.HIPS]
+        self.assertLess(buddy.pts[db.HEAD].y, buddy.pts[db.CHEST].y)
+        self.assertLess(buddy.pts[db.CHEST].y, hips.y)
+        for foot in (db.FOOT_L, db.FOOT_R):
+            self.assertGreater(buddy.pts[foot].y, hips.y)
+        self.assertLessEqual(self.hip_swing(buddy), 8)
+        for root, joint, tip, _span, _bulge, _f, _b, _fold in db.RAG_LIMBS:
+            a, mid, end = buddy.body[root], buddy.body[joint], buddy.body[tip]
+            cross = ((mid.x - a.x) * (end.y - mid.y) -
+                     (mid.y - a.y) * (end.x - mid.x))
+            dot = ((mid.x - a.x) * (end.x - mid.x) +
+                   (mid.y - a.y) * (end.y - mid.y))
+            self.assertGreater(abs(math.degrees(math.atan2(cross, dot))), 1.0)
+
+    def test_hard_landing_does_not_skid_across_the_floor(self):
+        buddy = self.buddy = db.Buddy(db.QRect(0, 0, 900, 600), 500)
+        buddy.ledges = [{"x0": 4, "x1": 896, "y": 500, "hwnd": -1}]
+        buddy.ledge = buddy.ledges[0]
+        buddy.allow_panic = False
+        buddy.go_free(18, -24, 0.08)
+        landed = None
+        for frame in range(180):
+            buddy.update(db.QPoint(800, 20))
+            low = max(point.y for point in buddy.pts)
+            if landed is None and low >= buddy.floor_y - 2 * db.SCALE - 0.1:
+                landed = (frame, sum(point.x for point in buddy.pts) / len(buddy.pts))
+            if landed is not None and frame == landed[0] + 60:
+                centre = sum(point.x for point in buddy.pts) / len(buddy.pts)
+                self.assertLess(abs(centre - landed[1]), 20 * db.SCALE)
+                return
+        self.fail("ragdoll did not remain on the floor long enough to measure")
+
+    def test_seeding_the_ragdoll_never_moves_a_posed_point(self):
+        buddy = self.buddy
+        for state in (db.WALK, db.IDLE, db.SIT, db.SLEEP, db.CLIMB):
+            with self.subTest(state=state):
+                self.settle(state)
+                posed = [(point.x, point.y) for point in buddy.pts]
+                buddy.seed_joints()
+                self.assertEqual(posed, [(point.x, point.y) for point in buddy.pts])
+                for tip, joint in db.LIMB_JOINT.items():
+                    self.assertIsNone(buddy.joint_of(tip))
+                    reach = math.hypot(buddy.body[joint].x - buddy.pts[tip].x,
+                                       buddy.body[joint].y - buddy.pts[tip].y)
+                    self.assertLess(reach, db.LEG_LEN)
+
     def test_all_kinematic_states_render(self):
         class Renderer:
             draw_buddy = db.Overlay.draw_buddy
@@ -296,6 +396,7 @@ class AnimationTests(unittest.TestCase):
         renderer.torso_pm = db.build_pixmap(db.TORSO_ART)
         for state, crouch in ((db.WALK, 0), (db.IDLE, 0), (db.SIT, 0),
                               (db.SLEEP, 0), (db.CLIMB, 0),
+                              (db.FREE, 0), (db.GRABBED, 0), (db.STUNNED, 0),
                               (db.WALK, 0.5), (db.WALK, 1), (db.IDLE, 1)):
             self.buddy.crouch = crouch
             self.settle(state)
