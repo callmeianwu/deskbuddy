@@ -119,6 +119,9 @@ SPOOK_CORNERED = 0.014      # and for having nowhere left to back away to
 WARY_LEVEL = 0.34           # he stops, faces you and backs away
 WARY_SPEED = 0.42 * SCALE
 WARY_STRIDE = 2.6 * SCALE
+TEETER_FRAMES = int(FPS * 0.45)      # heels over the drop before he goes over
+DROP_DEAF_FRAMES = int(FPS * 0.4)    # a ledge he stepped off cannot catch him
+                                     # again while his trailing foot clears it
 PANIC_LEVEL = 1.0           # he bolts
 PANIC_EXIT = 0.24           # and keeps running until his nerve drops to here
 JUMPY_NERVE = 0.52          # what a scare leaves behind, so round two is quicker
@@ -171,19 +174,81 @@ ARM_LEN = 9 * SCALE
 LEG_LEN = 11 * SCALE
 
 HEAD, CHEST, HIPS, HAND_L, HAND_R, FOOT_L, FOOT_R = range(7)
+# Knees and elbows exist only for the physics. They live after the seven drawn
+# points so the solver can treat every point alike while self.pts stays the
+# seven that the hand-authored poses write to.
+KNEE_L, KNEE_R, ELBOW_L, ELBOW_R = range(7, 11)
+BODY_POINTS = 11
+LIMB_JOINT = {FOOT_L: KNEE_L, FOOT_R: KNEE_R,
+              HAND_L: ELBOW_L, HAND_R: ELBOW_R}
+
+THIGH_LEN = SHIN_LEN = LEG_LEN * 0.5
+UPPER_ARM_LEN = FOREARM_LEN = ARM_LEN * 0.5
 
 STICKS = [
     (HEAD, CHEST, NECK_LEN, 1.0),
     (CHEST, HIPS, TORSO_LEN, 1.0),
-    (CHEST, HAND_L, ARM_LEN, 0.8),
-    (CHEST, HAND_R, ARM_LEN, 0.8),
-    (HIPS, FOOT_L, LEG_LEN, 0.9),
-    (HIPS, FOOT_R, LEG_LEN, 0.9),
-    (HEAD, HIPS, NECK_LEN + TORSO_LEN * 0.94, 0.55),   # keeps the spine honest
-    (HAND_L, HIPS, ARM_LEN * 1.05, 0.18),
-    (HAND_R, HIPS, ARM_LEN * 1.05, 0.18),
-    (FOOT_L, FOOT_R, LEG_LEN * 0.8, 0.12),
+    (HEAD, HIPS, NECK_LEN + TORSO_LEN * 0.94, 0.7),    # keeps the spine honest
+    (HIPS, KNEE_L, THIGH_LEN, 1.0),
+    (KNEE_L, FOOT_L, SHIN_LEN, 1.0),
+    (HIPS, KNEE_R, THIGH_LEN, 1.0),
+    (KNEE_R, FOOT_R, SHIN_LEN, 1.0),
+    (CHEST, ELBOW_L, UPPER_ARM_LEN, 1.0),
+    (ELBOW_L, HAND_L, FOREARM_LEN, 1.0),
+    (CHEST, ELBOW_R, UPPER_ARM_LEN, 1.0),
+    (ELBOW_R, HAND_R, FOREARM_LEN, 1.0),
+    (KNEE_L, KNEE_R, LEG_LEN * 0.26, 0.05),            # legs travel together
+    (FOOT_L, FOOT_R, LEG_LEN * 0.45, 0.07),
 ]
+
+# Ragdoll joint limits. Every angle is measured in the torso's own frame, so
+# they tumble with him and mean the same thing upside down.
+#   root, joint, tip, span, which way the joint bulges, swing forward,
+#   swing back, how far the limb may fold up
+RAG_LIMBS = (
+    (HIPS, KNEE_L, FOOT_L, LEG_LEN, 1.0,
+     math.radians(88), math.radians(32), LEG_LEN * 0.4),
+    (HIPS, KNEE_R, FOOT_R, LEG_LEN, 1.0,
+     math.radians(88), math.radians(32), LEG_LEN * 0.4),
+    (CHEST, ELBOW_L, HAND_L, ARM_LEN, -1.0,
+     math.radians(168), math.radians(58), ARM_LEN * 0.35),
+    (CHEST, ELBOW_R, HAND_R, ARM_LEN, -1.0,
+     math.radians(168), math.radians(58), ARM_LEN * 0.35),
+)
+NECK_SWING = math.radians(52)   # how far his head can loll off the spine
+JOINT_SOFTNESS = 0.55           # how hard a limit corrects in one pass
+BEND_BULGE = 0.35 * SCALE       # a hair of bend, so a hinge has a side to fold to
+REST_SPEED = 1.1 * SCALE        # slower than this and he settles, not bounces
+CONTACT_FRICTION = 0.2          # extra lateral damping while a point is supported
+GROUND_DRAG = 0.42              # removes sideways energy constraints add on contact
+
+# The righting reflex. While he is loose he is treated as the inverted
+# pendulum a falling person is. Whether he can still save it is decided by
+# the capture point, xi = com + v/omega0 with omega0 = sqrt(g/h): the spot his
+# weight is really headed for. While that lands inside a step of his feet he
+# can catch himself, and once it is past that the fall is committed and no
+# effort helps, which is why people flail for a moment and then go down.
+# An exponential envelope on top guarantees the effort always runs out.
+# Effort is only ever spent bracing toward a pose and killing speed, never
+# adding any, so no amount of it can throw him into the air.
+RIGHT_KP = 1.15                 # trunk thrown back, per radian of tilt
+RIGHT_KD = 4.5                  # and per radian per frame of tilt rate
+RIGHT_SHIFT = 0.42              # cap on that, as a fraction of his own height
+RIGHT_TAU = FPS * 1.0           # e-folding time of the effort envelope, frames
+RIGHT_SHARP = 6.0               # how abruptly authority dies past tipping point
+RIGHT_SMOOTH = 0.34             # lag on the sensed tilt rate, as real reflexes have
+RIGHT_SPIN = 0.085              # tumbling faster than this and he cannot find up
+RIGHT_DOWN = math.radians(70)   # leant further than this and he is not standing
+RIGHT_IMPACT = 11 * SCALE       # landing faster than this buckles him anyway
+RIGHT_TONE = 0.28               # how far toward the braced pose he gets in a frame
+RIGHT_BRACE = 0.22              # how much of his speed stiff muscles kill per frame
+RIGHT_AIR = 0.4                 # authority left with nothing under his feet
+RIGHT_STEP = LEG_LEN * 0.6      # furthest he can plant a foot from under himself
+RIGHT_STAGGER = LEG_LEN * 1.5   # and how much stepping he has in him all told
+RIGHT_UPRIGHT = math.radians(14)    # close enough to vertical to count as saved
+RIGHT_STEADY = math.radians(1.3)    # and slow enough, per frame
+RIGHT_CATCH = int(FPS * 0.4)    # held like that this long and he has it back
+RIGHT_GIVE_UP = 0.05            # below this the reflex is spent and he is limp
 
 RADII = {HEAD: 4.5 * SCALE, CHEST: 3 * SCALE, HIPS: 3 * SCALE}
 
@@ -385,7 +450,8 @@ class Buddy:
     def __init__(self, bounds, floor_y):
         self.bounds = bounds
         self.floor_y = floor_y     # top of the taskbar, not the screen bottom
-        self.pts = [Pt() for _ in range(7)]
+        self.body = [Pt() for _ in range(BODY_POINTS)]
+        self.pts = self.body[:7]   # the same objects; the ones poses drive
         self.state = WALK
         self.facing = 1
         self.phase = 0.0
@@ -404,13 +470,24 @@ class Buddy:
         self.look = (0.0, 0.0)
         self.grab_idx = None
         self.spin = 0.0
-        self.support = [None] * 7  # ledge a point landed on this frame
+        self.balance = 0.0         # 1 fighting the fall with everything, 0 limp
+        self.tilt_prev = None      # last frame's lean, for the damping term
+        self.tilt_rate = 0.0       # smoothed lean rate he actually reacts to
+        self.caught = 0            # frames he has held himself upright and still
+        self.step_to = None        # spot the catching foot is committed to
+        self.step_foot = FOOT_R
+        self.stagger = 0.0         # stepping he has left before the fall wins
+        self.support = [None] * BODY_POINTS  # ledge a point landed on this frame
+        self.ground_contact = False
         self.allow_perch = True
         self.allow_panic = SPOOK_ENABLED
         self.spook = 0.0           # nerve, 0 calm to PANIC_LEVEL and he bolts
         self.calm = 0              # frames where nothing can spook him
         self.panic_frames = 0
         self.panic_turn = 0        # cooldown so he does not jitter when cornered
+        self.teeter = 0            # frames spent backed up against a drop
+        self.drop_hwnd = None      # ledge he just walked off, and how much
+        self.drop_frames = 0       # longer it stays deaf to him
         self.cursor_near = 0.0     # 0 outside SPOOK_RADIUS, 1 right on top of him
         self.cursor_prev = None
         self.trail = []            # cursor samples, for throw velocity
@@ -467,6 +544,38 @@ class Buddy:
         p[HEAD].teleport(ax, gy - LEG_LEN - TORSO_LEN - NECK_LEN)
         p[HAND_L].teleport(ax - 3 * SCALE, gy - LEG_LEN - TORSO_LEN + ARM_LEN * 0.7)
         p[HAND_R].teleport(ax + 3 * SCALE, gy - LEG_LEN - TORSO_LEN + ARM_LEN * 0.7)
+        self.seed_joints()
+
+    def body_frame(self):
+        """Unit vectors up and forward along his torso, whatever way up he is."""
+        chest, hips = self.pts[CHEST], self.pts[HIPS]
+        ux, uy = chest.x - hips.x, chest.y - hips.y
+        d = math.hypot(ux, uy) or 1.0
+        ux, uy = ux / d, uy / d
+        return (ux, uy), (-uy * self.facing, ux * self.facing)
+
+    def seed_joints(self):
+        """Park the knees and elbows where the drawing already implies they are,
+        so handing a pose over to the physics never snaps a limb."""
+        _up, fwd = self.body_frame()
+        for root, joint, tip, span, bulge, _f, _b, _fold in RAG_LIMBS:
+            a, b_ = self.body[root], self.body[tip]
+            dx, dy = b_.x - a.x, b_.y - a.y
+            d = math.hypot(dx, dy) or 0.0001
+            reach = min(d, span)
+            out = max(BEND_BULGE,
+                      math.sqrt(max(0.0, (span * 0.5) ** 2 - (reach * 0.5) ** 2)))
+            nx, ny = -dy / d, dx / d
+            if (nx * fwd[0] + ny * fwd[1]) * bulge < 0:
+                nx, ny = -nx, -ny
+            self.body[joint].teleport((a.x + b_.x) / 2 + nx * out,
+                                      (a.y + b_.y) / 2 + ny * out)
+
+    def joint_of(self, tip):
+        """The simulated knee or elbow for a limb, while the physics is running."""
+        if self.state not in (GRABBED, FREE, STUNNED):
+            return None
+        return self.body[LIMB_JOINT[tip]]
 
     def animate(self):
         """Kinematic poses. Physics is off; we just place the points."""
@@ -600,11 +709,19 @@ class Buddy:
             if progress >= 1.0:
                 self.pose_from = None
 
+        self.seed_joints()
+
     # -- physics ----------------------------------------------------------
 
     def integrate(self):
-        self.support = [None] * 7
-        for i, pt in enumerate(self.pts):
+        # Reuse the list instead of reallocating it every frame - this runs
+        # at 60fps while ragdolling, and a fresh list each call was the
+        # single biggest source of transient garbage in the physics step.
+        support = self.support
+        for i in range(len(support)):
+            support[i] = None
+        self.ground_contact = False
+        for pt in self.body:
             vx = (pt.x - pt.px) * AIR_DRAG
             vy = (pt.y - pt.py) * AIR_DRAG
             pt.px, pt.py = pt.x, pt.y
@@ -613,7 +730,7 @@ class Buddy:
         if self.spin:
             cx = sum(p.x for p in self.pts) / 7
             cy = sum(p.y for p in self.pts) / 7
-            for pt in self.pts:
+            for pt in self.body:
                 dx, dy = pt.x - cx, pt.y - cy
                 pt.x += -dy * self.spin
                 pt.y += dx * self.spin
@@ -623,24 +740,128 @@ class Buddy:
 
     def solve(self):
         for _ in range(CONSTRAINT_PASSES):
-            for a, b, rest, stiff in STICKS:
-                pa, pb = self.pts[a], self.pts[b]
-                dx, dy = pb.x - pa.x, pb.y - pa.y
-                d = math.hypot(dx, dy) or 0.0001
-                diff = (d - rest) / d * 0.5 * stiff
-                ox, oy = dx * diff, dy * diff
-                if self.grab_idx != a:
-                    pa.x += ox
-                    pa.y += oy
-                if self.grab_idx != b:
-                    pb.x -= ox
-                    pb.y -= oy
+            self.sticks()
+            self.limit_joints()
+            self.untangle()
             self.collide()
+        # bones twice at the end, so nothing a limit nudged is left stretched
+        # on screen for the frame
+        self.sticks()
+        self.sticks()
+        self.collide()
+        if self.ground_contact:
+            for pt in self.body:
+                pt.px = pt.x - pt.vx * GROUND_DRAG
+
+    def sticks(self):
+        for a, b, rest, stiff in STICKS:
+            pa, pb = self.body[a], self.body[b]
+            dx, dy = pb.x - pa.x, pb.y - pa.y
+            d = math.hypot(dx, dy) or 0.0001
+            diff = (d - rest) / d * 0.5 * stiff
+            ox, oy = dx * diff, dy * diff
+            if self.grab_idx != a:
+                pa.x += ox
+                pa.y += oy
+            if self.grab_idx != b:
+                pb.x -= ox
+                pb.y -= oy
+
+    # -- joint limits -----------------------------------------------------
+
+    def limit_joints(self):
+        """Hips, shoulders, neck and the two hinges. Without these he folds
+        through himself and settles in shapes a body cannot make."""
+        up, fwd = self.body_frame()
+        down = (-up[0], -up[1])
+        held = self.grab_idx
+        if held not in (HEAD, CHEST):
+            self._swing(self.body[CHEST], (self.body[HEAD],), up, fwd,
+                        NECK_SWING, NECK_SWING)
+        for root, joint, tip, _span, bulge, swing_f, swing_b, fold in RAG_LIMBS:
+            a, j, t = self.body[root], self.body[joint], self.body[tip]
+            self._hinge(a, j, t, fwd, bulge)
+            if held == root or held == tip:
+                continue      # the hand of his you are holding stays put
+            self._swing(a, (j, t), down, fwd, swing_f, swing_b)
+            self._unfold(a, t, fold)
+
+    def _swing(self, root, movers, axis, fwd, limit_fwd, limit_back):
+        """Swing a whole limb back into the cone it is allowed to reach."""
+        lead = movers[0]
+        vx, vy = lead.x - root.x, lead.y - root.y
+        if abs(vx) < 0.0001 and abs(vy) < 0.0001:
+            return
+        angle = math.atan2(vx * fwd[0] + vy * fwd[1],
+                           vx * axis[0] + vy * axis[1])
+        clamped = max(-limit_back, min(limit_fwd, angle))
+        if clamped == angle:
+            return
+        # the (axis, fwd) basis flips handedness with his facing, so the world
+        # rotation that closes the gap flips with it too
+        handed = axis[0] * fwd[1] - axis[1] * fwd[0]
+        turn = (clamped - angle) * handed * JOINT_SOFTNESS
+        cos_t, sin_t = math.cos(turn), math.sin(turn)
+        for pt in movers:
+            dx, dy = pt.x - root.x, pt.y - root.y
+            pt.x = root.x + dx * cos_t - dy * sin_t
+            pt.y = root.y + dx * sin_t + dy * cos_t
+
+    def _hinge(self, root, joint, tip, fwd, bulge):
+        """Knees fold forward and elbows back, never the other way round."""
+        dx, dy = tip.x - root.x, tip.y - root.y
+        d = math.hypot(dx, dy)
+        if d < 0.0001:
+            return
+        nx, ny = -dy / d, dx / d
+        if (nx * fwd[0] + ny * fwd[1]) * bulge < 0:
+            nx, ny = -nx, -ny
+        out = ((joint.x - (root.x + tip.x) / 2) * nx +
+               (joint.y - (root.y + tip.y) / 2) * ny)
+        if out < BEND_BULGE:
+            push = (BEND_BULGE - out) * JOINT_SOFTNESS
+            joint.x += nx * push
+            joint.y += ny * push
+
+    def _unfold(self, a, b_, least):
+        """A limb can fold, but not flat back on itself."""
+        dx, dy = b_.x - a.x, b_.y - a.y
+        d = math.hypot(dx, dy)
+        if d >= least:
+            return
+        if d < 0.0001:
+            dx, dy, d = 0.0, least, least
+        push = (least - d) / d * 0.5 * JOINT_SOFTNESS
+        a.x -= dx * push
+        a.y -= dy * push
+        b_.x += dx * push
+        b_.y += dy * push
+
+    def untangle(self):
+        """Keep his legs out of his own head and chest. Arms are left alone -
+        this is a side view, so an arm lying across the torso is just an arm
+        in front of him, and shoving it clear only makes him look winged."""
+        chest, head = self.body[CHEST], self.body[HEAD]
+        for i in (FOOT_L, FOOT_R, KNEE_L, KNEE_R):
+            if i == self.grab_idx:
+                continue
+            pt = self.body[i]
+            self._clear_ball(pt, head, RADII[HEAD] * 0.9)
+            self._clear_ball(pt, chest, RADII[CHEST])
+
+    def _clear_ball(self, pt, centre, radius):
+        ox, oy = pt.x - centre.x, pt.y - centre.y
+        d = math.hypot(ox, oy)
+        if d >= radius or d < 0.0001:
+            return
+        push = (radius - d) / d * JOINT_SOFTNESS
+        pt.x += ox * push
+        pt.y += oy * push
 
     def collide(self):
         left, right = self.bounds.left(), self.bounds.right()
         floor = self.floor_y
-        for i, pt in enumerate(self.pts):
+        for i, pt in enumerate(self.body):
             r = RADII.get(i, 2 * SCALE)
 
             if pt.x < left + r:
@@ -659,15 +880,21 @@ class Buddy:
             # upward. Without this it falls through on the next pass.
             held = self.support[i]
             if held is not None:
-                top, x0, x1 = held
+                top, x0, x1, damped = held
                 if x0 < pt.x < x1:
+                    self.ground_contact = True
                     if pt.y > top:
                         pt.y = top
+                    if not damped:
+                        pt.px = pt.x - pt.vx * CONTACT_FRICTION
+                        self.support[i] = (top, x0, x1, True)
                     continue
                 self.support[i] = None
 
             landed = False
             for lg in self.ledges:
+                if self.drop_frames > 0 and lg["hwnd"] == self.drop_hwnd:
+                    continue
                 top = lg["y"] - r
                 if not (lg["x0"] < pt.x < lg["x1"]):
                     continue
@@ -675,7 +902,8 @@ class Buddy:
                 # pulled him under
                 if pt.py <= top + 1 and pt.y > top:
                     self._land(pt, top)
-                    self.support[i] = (top, lg["x0"], lg["x1"])
+                    self.support[i] = (top, lg["x0"], lg["x1"], False)
+                    self.ground_contact = True
                     landed = True
                     break
             if landed:
@@ -683,6 +911,7 @@ class Buddy:
 
             if pt.y > floor - r:
                 self._land(pt, floor - r)
+                self.ground_contact = True
                 continue
 
             if pt.y < self.bounds.top() + r:
@@ -692,11 +921,130 @@ class Buddy:
     def _land(self, pt, y):
         vx, vy = pt.vx, pt.vy
         pt.y = y
-        pt.py = pt.y + vy * BOUNCE
-        pt.px = pt.x - vx * FRICTION
+        if vy > REST_SPEED:
+            pt.py = pt.y + vy * BOUNCE
+            pt.px = pt.x - vx * FRICTION
+        else:
+            # too slow to bounce. Letting it rest is what stops a limb
+            # buzzing against the floor while the solver argues with gravity.
+            pt.py = pt.y
+            pt.px = pt.x - vx * FRICTION * 0.6
 
     def energy(self):
         return sum(abs(p.vx) + abs(p.vy) for p in self.pts)
+
+    # -- balance ----------------------------------------------------------
+
+    def right_self(self, footed):
+        """One frame of the righting reflex. See the RIGHT_* constants."""
+        hips, head = self.body[HIPS], self.body[HEAD]
+        lx, ly = head.x - hips.x, head.y - hips.y
+        length = math.hypot(lx, ly) or 1.0
+        tilt = math.atan2(lx, -ly)          # 0 upright, signed by the way he goes
+        raw = 0.0 if self.tilt_prev is None else \
+            (tilt - self.tilt_prev + math.pi) % math.tau - math.pi
+        self.tilt_prev = tilt
+        # A reflex reads a filtered, slightly stale rate, not the solver's
+        # frame-to-frame twitch, so his effort ramps instead of strobing.
+        rate = self.tilt_rate + (raw - self.tilt_rate) * RIGHT_SMOOTH
+        self.tilt_rate = rate
+
+        fl, fr = self.body[FOOT_L], self.body[FOOT_R]
+        com_x = sum(p.x for p in self.pts) / 7
+        com_y = sum(p.y for p in self.pts) / 7
+        com_vx = sum(p.vx for p in self.pts) / 7
+        com_vy = sum(p.vy for p in self.pts) / 7
+        stand = max(fl.y, fr.y)
+        omega0 = math.sqrt(GRAVITY / max(stand - com_y, LEG_LEN * 0.5))
+        # Judged in the air as well as on the ground: a body already travelling
+        # faster than it can ever step to keep up with is going down, and no
+        # amount of bracing on landing is allowed to pretend otherwise. The
+        # tolerance is whatever stagger he has left, so the last step he has in
+        # him is also the last chance he gets.
+        xi = com_x + com_vx / omega0
+        out = max(min(fl.x, fr.x) - xi, xi - max(fl.x, fr.x), 0.0)
+        reach = max(2.0 * SCALE, min(RIGHT_STEP, self.stagger))
+        commit = 1.0 / (1.0 + math.exp(RIGHT_SHARP * (out / reach - 1.0)))
+        # Never climbs: once the capture point is away the fall is committed,
+        # and the envelope only ever runs down from there.
+        self.balance = min(self.balance,
+                           commit
+                           * math.exp(-self.free_frames / RIGHT_TAU)
+                           * max(0.0, 1.0 - abs(tilt) / RIGHT_DOWN)
+                           * max(0.0, 1.0 - abs(self.spin) / RIGHT_SPIN)
+                           * max(0.0, 1.0 - max(0.0, com_vy) / RIGHT_IMPACT))
+        if self.balance < RIGHT_GIVE_UP:
+            self.balance = 0.0
+            self.caught = 0
+            return
+
+        # Hip strategy: the trunk is thrown back against the fall and the hips
+        # go the other way, which shifts his weight without his feet moving.
+        shift = -(RIGHT_KP * math.sin(tilt) + RIGHT_KD * rate) * self.balance
+        shift = max(-RIGHT_SHIFT, min(RIGHT_SHIFT, shift)) * length
+
+        # The pose is built over his feet, which friction holds in place, so
+        # bracing pulls his weight back above his base instead of sliding it
+        # along the floor. Only the stepping foot travels.
+        hx = (fl.x + fr.x) / 2 if footed else hips.x
+        gy = stand if footed else hips.y + LEG_LEN   # where his feet belong
+        hy = gy - LEG_LEN
+        cy = hy - TORSO_LEN
+        knee_y = hy + THIGH_LEN * 0.92
+        bulge = self.facing * BEND_BULGE * 2
+
+        # The capture step: a foot goes for the ground under where his weight is
+        # headed, as far as his legs reach and no further. The spot is latched
+        # until he gets there, because a step is a commitment, not a drift, and
+        # he only has so much stagger in him before there is nowhere left to go.
+        catch = max(hx - RIGHT_STEP, min(hx + RIGHT_STEP,
+                                         com_x + com_vx / omega0))
+        if self.step_to is None \
+                or abs(self.body[self.step_foot].x - self.step_to) < 2 * SCALE \
+                or abs(self.step_to - hx) > RIGHT_STEP:
+            stride = math.copysign(min(abs(catch - hx), self.stagger), catch - hx)
+            self.step_to = hx + stride
+            self.step_foot = FOOT_R if stride > 0 else FOOT_L
+            self.stagger -= abs(stride)
+        lead = self.step_foot
+        trail = FOOT_L if lead == FOOT_R else FOOT_R
+
+        grip = RIGHT_TONE * self.balance
+        brace = RIGHT_BRACE * self.balance
+        if not footed:
+            grip *= RIGHT_AIR
+            brace *= RIGHT_AIR
+
+        # Applied directly instead of via a dict of target points - this runs
+        # every ragdoll frame, and building and iterating a fresh dict and
+        # its tuples here was a steady source of transient garbage.
+        def brace_toward(i, tx, ty):
+            pt = self.body[i]
+            vx, vy = pt.vx, pt.vy
+            pt.x += (tx - pt.x) * grip
+            pt.y += (ty - pt.y) * grip
+            # Bracing spends the speed he already has; it never hands him any,
+            # so no amount of effort can fling him off the floor.
+            pt.px = pt.x - vx * (1.0 - brace)
+            pt.py = pt.y - vy * (1.0 - brace)
+
+        # hips counter the trunk, so the weight moves but the pose does not
+        brace_toward(HIPS, hx - shift * 0.35, hy)
+        brace_toward(CHEST, hx + shift, cy)
+        brace_toward(HEAD, hx + shift * 1.2, cy - NECK_LEN)
+        brace_toward(ELBOW_L, hx + shift - ARM_LEN * 0.42, cy + ARM_LEN * 0.05)
+        brace_toward(ELBOW_R, hx + shift + ARM_LEN * 0.42, cy + ARM_LEN * 0.05)
+        brace_toward(HAND_L, hx + shift - ARM_LEN * 0.72, cy - ARM_LEN * 0.3)
+        brace_toward(HAND_R, hx + shift + ARM_LEN * 0.72, cy - ARM_LEN * 0.3)
+        brace_toward(KNEE_L, (hx + fl.x) / 2 + bulge, knee_y)
+        brace_toward(KNEE_R, (hx + fr.x) / 2 + bulge, knee_y)
+        brace_toward(lead, self.step_to, gy)
+        brace_toward(trail, self.body[trail].x, gy)
+
+        if footed and abs(tilt) < RIGHT_UPRIGHT and abs(rate) < RIGHT_STEADY:
+            self.caught += 1
+        else:
+            self.caught = 0
 
     # -- state changes ----------------------------------------------------
 
@@ -708,9 +1056,31 @@ class Buddy:
         self.spin = spin
         self.free_frames = 0
         self.stun = 0
-        for pt in self.pts:
+        self.teeter = 0
+        self.balance = 1.0
+        self.tilt_prev = None
+        self.tilt_rate = 0.0
+        self.caught = 0
+        self.step_to = None
+        self.stagger = RIGHT_STAGGER
+        self.seed_joints()
+        for pt in self.body:
             pt.kick(vx + random.uniform(-0.6, 0.6),
                     vy + random.uniform(-0.6, 0.6))
+
+    def step_off(self, vx):
+        """Walk clean off the ledge he is on, carrying his speed with him.
+
+        No upward kick: he does not hop off an edge, he just stops having
+        anything under him. The ledge goes deaf for a moment so the foot he
+        has not swung past the edge yet cannot land back on it and tip him
+        over backwards.
+        """
+        if self.ledge is not None:
+            self.drop_hwnd = self.ledge["hwnd"]
+            self.drop_frames = DROP_DEAF_FRAMES
+            self.ledge = None
+        self.go_free(vx, 0.0, spin=math.copysign(random.uniform(0.02, 0.05), vx))
 
     def stand_up(self):
         """Find whatever he is lying on and start walking again."""
@@ -848,6 +1218,8 @@ class Buddy:
         if self.state == SIT:
             self.sit_time += 1.0 / FPS
         self.timer -= 1
+        if self.drop_frames > 0:
+            self.drop_frames -= 1
         if self.blink > 0:
             self.blink -= 1
         elif random.random() < 0.006:
@@ -873,6 +1245,9 @@ class Buddy:
             elif self.state == WARY and self.spook < WARY_LEVEL * 0.55:
                 self.state = WALK
                 self.timer = random.randint(90, 220)
+                # WARY leaves him facing the cursor (he backs away from it);
+                # keep walking away instead of turning straight back into it
+                self.facing = 1 if cx < self.anchor_x else -1
 
         if self.state == GRABBED:
             pt = self.pts[self.grab_idx]
@@ -883,10 +1258,16 @@ class Buddy:
             return
 
         if self.state in (FREE, STUNNED):
+            footed = self.ground_contact      # integrate() clears it
             self.integrate()
+            if self.state == FREE:
+                self.right_self(footed)
             self.solve()
             if self.state == FREE:
                 self.free_frames += 1
+                if self.caught > RIGHT_CATCH:
+                    self.stand_up()   # he got his feet back under him
+                    return
                 if self.energy() < 1.4 * SCALE:
                     self.stun += 1
                     if self.stun > 6:
@@ -944,13 +1325,22 @@ class Buddy:
             self.ledge = live
 
         if self.state == WARY:
-            # faces the cursor and gives ground, but will not back off a ledge
+            # faces the cursor and gives ground, and on a window he runs out of
+            # ledge before he runs out of nerve
             self.facing = 1 if cx > self.anchor_x else -1
             want = self.anchor_x - self.facing * self.wary_speed()
             self.anchor_x = min(max(want, self.walk_min()), self.walk_max())
             if abs(want - self.anchor_x) > 0.01 and self.cursor_near > 0.0:
                 # nowhere left to go, but only while the cursor is still a threat
                 self.spook += SPOOK_CORNERED * self.cursor_near
+                self.teeter += 1
+                if self.ledge and self.ledge["hwnd"] != -1 \
+                        and self.teeter > TEETER_FRAMES:
+                    self.step_off(-self.facing * self.wary_speed())
+                    self.spook = JUMPY_NERVE
+                    return
+            else:
+                self.teeter = 0
             self.animate()
             return
 
@@ -979,10 +1369,9 @@ class Buddy:
             if self.anchor_x < lo or self.anchor_x > hi:
                 self.anchor_x = min(max(self.anchor_x, lo), hi)
                 if self.ledge:              # runs clean off the ledge
-                    self.ledge = None
-                    self.go_free(self.facing * PANIC_SPEED * 0.8,
-                                 -PANIC_SPEED * 0.5,
-                                 spin=self.facing * random.uniform(0.02, 0.06))
+                    self.step_off(PANIC_SPEED
+                                  * (1.0 - CRAWL_SLOWDOWN * self.crouch)
+                                  * self.facing)
                     self.spook = JUMPY_NERVE
                     return
                 self.facing *= -1           # cornered against the screen edge
@@ -1008,8 +1397,9 @@ class Buddy:
             if self.anchor_x < lo or self.anchor_x > hi:
                 self.anchor_x = min(max(self.anchor_x, lo), hi)
                 if self.ledge and random.random() < 0.35:
-                    self.ledge = None       # step off the edge on purpose
-                    self.go_free(self.facing * 1.5, -1.0)
+                    self.step_off(WALK_SPEED
+                                  * (1.0 - CRAWL_SLOWDOWN * self.crouch)
+                                  * self.facing)   # steps off on purpose
                     return
                 self.facing *= -1
             if self.timer <= 0:
@@ -1111,6 +1501,7 @@ class Overlay(QWidget):
         self.dragging = False
         self.frames = 0
         self.paints = 0
+        self.dirty_prev = None   # his painted area last frame, so it gets erased
         self.paint_error = None
 
         log(f"DeskBuddy on {self.screen_ref.name()}  "
@@ -1290,7 +1681,28 @@ class Overlay(QWidget):
                 log("  paintEvent never fired - the window is not being asked "
                     "to draw at all")
 
-        self.update()
+        if beacon or DEBUG_OUTLINE or self.frames == FPS * BEACON_SECONDS:
+            # The beacon fills the screen, and debug mode paints overlays
+            # (floor line, ledges) across the whole width, so both still need
+            # a full repaint. The exact frame the beacon ends also needs one
+            # last full repaint, to erase it - after that, partial updates
+            # would leave it stuck on screen forever.
+            self.update()
+            self.dirty_prev = None
+        else:
+            # Repainting the whole primary-monitor-sized transparent overlay
+            # every frame at 60fps - regardless of how little of it actually
+            # changed - was the main cost driving up GPU/compositor memory
+            # and CPU use, most noticeable while ragdolling flings him across
+            # a much wider area than his usual walk/idle footprint. Only
+            # invalidate where he was and where he now is; Qt clears that
+            # region to transparent before paintEvent runs, so nothing is
+            # left behind.
+            dirty = self.buddy.bounds_rect(30 * SCALE) \
+                .translated(-self.virt.left(), -self.virt.top())
+            region = dirty if self.dirty_prev is None else dirty.united(self.dirty_prev)
+            self.dirty_prev = dirty
+            self.update(region)
 
     # -- input ------------------------------------------------------------
 
@@ -1494,11 +1906,13 @@ class Overlay(QWidget):
             if b.facing < 0:
                 back, front = front, back
 
-            self.limb(p, hips, pts[back[1]], PALETTE["P"], PALETTE["F"], True)
-            self.arm(p, chest, pts[back[0]], b.facing)
+            self.limb(p, hips, pts[back[1]], PALETTE["P"], PALETTE["F"], True,
+                      b.joint_of(back[1]))
+            self.arm(p, chest, pts[back[0]], b.facing, b.joint_of(back[0]))
             self.part(p, self.torso_pm, chest, hips)
-            self.limb(p, hips, pts[front[1]], PALETTE["P"], PALETTE["F"], True)
-            self.arm(p, chest, pts[front[0]], b.facing)
+            self.limb(p, hips, pts[front[1]], PALETTE["P"], PALETTE["F"], True,
+                      b.joint_of(front[1]))
+            self.arm(p, chest, pts[front[0]], b.facing, b.joint_of(front[0]))
         self.draw_head(p, head, chest)
 
         if b.state == SLEEP:
@@ -1536,14 +1950,17 @@ class Overlay(QWidget):
                        f"box {r.x()},{r.y()} {r.width()}x{r.height()}   "
                        f"clickthrough {self.clickthrough}")
 
-    def arm(self, p, a, b_, bend):
+    def arm(self, p, a, b_, bend, joint=None):
         """Two segments with an implied elbow, so it reads as an arm."""
-        mx, my = (a.x + b_.x) / 2, (a.y + b_.y) / 2
-        dx, dy = b_.x - a.x, b_.y - a.y
-        d = math.hypot(dx, dy) or 1
-        nx, ny = -dy / d, dx / d
-        slack = max(0.0, ARM_LEN - d) * 0.5 + 1.2 * SCALE
-        ex, ey = mx + nx * slack * bend, my + ny * slack * bend
+        if joint is not None:
+            ex, ey = joint.x, joint.y
+        else:
+            mx, my = (a.x + b_.x) / 2, (a.y + b_.y) / 2
+            dx, dy = b_.x - a.x, b_.y - a.y
+            d = math.hypot(dx, dy) or 1
+            nx, ny = -dy / d, dx / d
+            slack = max(0.0, ARM_LEN - d) * 0.5 + 1.2 * SCALE
+            ex, ey = mx + nx * slack * bend, my + ny * slack * bend
         pen = QPen(PALETTE["S"], int(2 * SCALE), Qt.SolidLine, Qt.SquareCap)
         p.setPen(pen)
         p.drawLine(int(a.x), int(a.y), int(ex), int(ey))
@@ -1554,16 +1971,19 @@ class Overlay(QWidget):
         p.fillRect(int(b_.x - SCALE), int(b_.y - SCALE),
                    int(2 * SCALE), int(2 * SCALE), PALETTE["S"])
 
-    def limb(self, p, a, b_, col, shoe, with_shoe):
-        dx, dy = b_.x - a.x, b_.y - a.y
-        d = math.hypot(dx, dy) or 1
-        nx, ny = dy / d * self.buddy.facing, -dx / d * self.buddy.facing
-        slack = math.sqrt(max(0.0, LEG_LEN ** 2 - d ** 2)) * 0.5
-        ex, ey = (a.x + b_.x) / 2 + nx * slack, (a.y + b_.y) / 2 + ny * slack
-        if self.buddy.state in (WALK, IDLE, PANIC, WARY):
-            crouch = self.buddy.crouch
-            ex += (b_.x + self.buddy.facing * 5 * SCALE - ex) * crouch
-            ey += (b_.y + SCALE - ey) * crouch
+    def limb(self, p, a, b_, col, shoe, with_shoe, joint=None):
+        if joint is not None:
+            ex, ey = joint.x, joint.y
+        else:
+            dx, dy = b_.x - a.x, b_.y - a.y
+            d = math.hypot(dx, dy) or 1
+            nx, ny = dy / d * self.buddy.facing, -dx / d * self.buddy.facing
+            slack = math.sqrt(max(0.0, LEG_LEN ** 2 - d ** 2)) * 0.5
+            ex, ey = (a.x + b_.x) / 2 + nx * slack, (a.y + b_.y) / 2 + ny * slack
+            if self.buddy.state in (WALK, IDLE, PANIC, WARY):
+                crouch = self.buddy.crouch
+                ex += (b_.x + self.buddy.facing * 5 * SCALE - ex) * crouch
+                ey += (b_.y + SCALE - ey) * crouch
         p.setPen(QPen(col, int(2.4 * SCALE), Qt.SolidLine, Qt.SquareCap))
         p.drawLine(int(a.x), int(a.y), int(ex), int(ey))
         p.drawLine(int(ex), int(ey), int(b_.x), int(b_.y))
